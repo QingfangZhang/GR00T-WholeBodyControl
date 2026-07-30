@@ -196,6 +196,7 @@ uv.lock
 
 # Virtual environments (created by install_scripts/)
 .venv_sim/
+.venv_replay/
 .venv_teleop/
 .venv_data_collection/
 .venv_camera/
@@ -219,3 +220,4 @@ models/
 # Downloaded from HuggingFace (hf download)
 sample_data/
 sonic_release/
+low_latency/
