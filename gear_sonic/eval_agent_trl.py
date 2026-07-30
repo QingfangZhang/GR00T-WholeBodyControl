@@ -102,6 +102,20 @@ def main(override_config: omegaconf.OmegaConf):
             import io
             train_config = omegaconf.OmegaConf.load(io.StringIO(raw))
 
+            # Older internal checkpoints may contain reward terms that were not
+            # released with gear_sonic. Rewards are not needed to restore the
+            # policy for evaluation, and leaving these terms in the config makes
+            # RewardsCfg construction fail before the checkpoint can be loaded.
+            legacy_reward_terms = ("energy_consumption",)
+            rewards_cfg = train_config.get("manager_env", {}).get("rewards", {})
+            for reward_name in legacy_reward_terms:
+                if reward_name in rewards_cfg:
+                    rewards_cfg.pop(reward_name)
+                    logger.warning(
+                        f"Ignoring unsupported legacy reward term '{reward_name}' "
+                        "from the checkpoint config during evaluation."
+                    )
+
             if train_config.eval_overrides is not None:
                 train_config = omegaconf.OmegaConf.merge(train_config, train_config.eval_overrides)
 
