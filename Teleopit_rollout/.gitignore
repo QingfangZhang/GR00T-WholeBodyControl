@@ -1,0 +1,6 @@
+.venv/
+.uv-cache/
+assets/
+data/
+__pycache__/
+*.py[cod]
