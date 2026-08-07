@@ -5,7 +5,9 @@
 source .venv_sim/bin/activate
 
 # EXPNAME="20260720_144342_g1_sim"
-EXPNAME="20260612_144127_g1_sim"
+# EXPNAME="20260612_144127_g1_sim"
+# EXPNAME="20260612_144154_g1_sim"
+EXPNAME="20260612_144214_g1_sim"
 
 # 思路一
 python change_ckpt/launch_checkpoint_rollout.py run \
