@@ -15,9 +15,10 @@ the original ten temporal lags (for example ``0,5,9,...,9``), then rearranges
 qpos/qvel/pelvis-quaternion values so the unchanged C++ step-5 gatherer sees
 those lags.  No ``reference_motion`` value or external token is sent.
 
-The regular checkpoint needs at least 46 packet frames because its G1 encoder
-samples offsets ``0, 5, ..., 45``; low-latency needs at least 10 frames because
-it samples offsets ``0, 1, ..., 9``.
+The regular and SONIC v1.1 checkpoints need at least 46 packet frames because
+their G1 encoders sample offsets ``0, 5, ..., 45``; low-latency needs at least
+10 frames because it samples offsets ``0, 1, ..., 9``.  SONIC v1.1 always uses
+the canonical offsets and never accepts the recorded-lag compatibility mode.
 """
 
 from __future__ import annotations
@@ -45,7 +46,11 @@ if str(REPO_ROOT) not in sys.path:
 DEFAULT_INPUT = (
     REPO_ROOT / "sample_data/ztj/20260612/20260612_144117_g1_sim"
 )
-MIN_PACKET_FRAMES = {"regular": 46, "low_latency": 10}
+MIN_PACKET_FRAMES = {
+    "regular": 46,
+    "low_latency": 10,
+    "sonic_v1_1": 46,
+}
 REGULAR_GATHER_STEP = 5
 REGULAR_NUM_SLOTS = 10
 CANONICAL_REGULAR_LAGS = tuple(
@@ -105,6 +110,10 @@ def _normalise_layout(value: str) -> str:
         "low": "low_latency",
         "low-latency": "low_latency",
         "low_latency": "low_latency",
+        "sonic_v1_1": "sonic_v1_1",
+        "sonic-v1.1": "sonic_v1_1",
+        "v1.1": "sonic_v1_1",
+        "v1_1": "sonic_v1_1",
     }
     try:
         return aliases[value]
@@ -247,6 +256,12 @@ def build_pose_payload(
             f"got {packet_frames}"
         )
 
+    if layout == "sonic_v1_1" and regular_future_lags is not None:
+        raise TrackPublisherError(
+            "sonic_v1_1 always uses canonical encoder lags [0,5,...,45]; "
+            "recorded regular future lags are not supported"
+        )
+
     if layout == "regular" and regular_future_lags is not None:
         joint_pos = _regular_recorded_lag_window(
             sequence.joint_pos, current, packet_frames, regular_future_lags
@@ -348,8 +363,11 @@ def _sequence_diagnostics(
     counts = np.asarray(sequence.group_row_counts, dtype=np.int64)
     quaternions = np.asarray(sequence.root_quat_wxyz, dtype=np.float64)
     norms = np.linalg.norm(quaternions, axis=1)
-    recorded_window = args.regular_future_window == "recorded"
-    if args.checkpoint_layout == "regular":
+    recorded_window = (
+        args.checkpoint_layout == "regular"
+        and args.regular_future_window == "recorded"
+    )
+    if args.checkpoint_layout in {"regular", "sonic_v1_1"}:
         encoder_lags = (
             list(args.regular_future_lags)
             if recorded_window
@@ -649,6 +667,10 @@ def build_parser() -> argparse.ArgumentParser:
             "low_latency",
             "low",
             "low-latency",
+            "sonic_v1_1",
+            "sonic-v1.1",
+            "v1.1",
+            "v1_1",
             "auto",
         ),
         default="auto",
@@ -700,7 +722,8 @@ def build_parser() -> argparse.ArgumentParser:
 def _validate_args(args: argparse.Namespace) -> None:
     if args.checkpoint_layout == "auto":
         raise TrackPublisherError(
-            "--checkpoint-layout must be regular or low_latency for qpos-track"
+            "--checkpoint-layout must be regular, low_latency, or sonic_v1_1 "
+            "for qpos-track"
         )
     args.checkpoint_layout = _normalise_layout(args.checkpoint_layout)
     if (

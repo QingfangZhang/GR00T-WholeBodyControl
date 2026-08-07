@@ -94,6 +94,9 @@ ENCODER_OBSERVATION_DIMS: dict[str, int] = {
     "motion_joint_positions_10frame_step1": 290,
     "motion_joint_velocities_10frame_step1": 290,
     "motion_anchor_orientation_10frame_step1": 60,
+    "motion_anchor_orientation_heading_10frame_step5": 60,
+    "motion_anchor_orientation_heading_10frame_step1": 60,
+    "motion_anchor_orientation_heading": 6,
     "motion_anchor_orientation": 6,
     "motion_root_z_position": 1,
     "motion_root_z_position_10frame_step5": 10,
@@ -107,6 +110,7 @@ ENCODER_OBSERVATION_DIMS: dict[str, int] = {
     "vr_3point_local_orn_target": 12,
     "smpl_joints_10frame_step1": 720,
     "smpl_anchor_orientation_10frame_step1": 60,
+    "smpl_anchor_orientation_heading_10frame_step1": 60,
     "motion_joint_positions_wrists_10frame_step1": 60,
     "smpl_joints_4frame_step1": 288,
     "smpl_anchor_orientation_4frame_step1": 24,
@@ -179,11 +183,31 @@ def _normalise_checkpoint(name: str) -> str:
         "low": "low_latency",
         "low-latency": "low_latency",
         "low_latency": "low_latency",
+        "sonic_v1_1": "sonic_v1_1",
+        "sonic-v1-1": "sonic_v1_1",
+        "v1.1": "sonic_v1_1",
+        "v1_1": "sonic_v1_1",
     }
     try:
         return aliases[name]
     except KeyError as exc:
         raise PreflightError(f"Unsupported checkpoint name: {name}") from exc
+
+
+def _publisher_checkpoint_layout(checkpoint: str) -> str:
+    """Return the publisher layout for a checkpoint family.
+
+    SONIC v1.1 has its own explicit publisher layout so diagnostics retain the
+    tested controller name.  It still streams world-frame quaternions and uses
+    the canonical regular-style 10-frame, step-5 gather window; the C++
+    observation registry performs the heading normalization.
+    """
+    return _normalise_checkpoint(checkpoint)
+
+
+def _required_future_frames(checkpoint: str) -> int:
+    checkpoint = _normalise_checkpoint(checkpoint)
+    return 46 if checkpoint in ("regular", "sonic_v1_1") else 10
 
 
 def resolve_model_files(args: argparse.Namespace) -> ModelFiles:
@@ -192,6 +216,10 @@ def resolve_model_files(args: argparse.Namespace) -> ModelFiles:
         model_root = CHECKPOINT_SOURCE_ROOT / "models/low_latency"
         default_config = model_root / "observation_config.yaml"
         encoder_input = 1247
+    elif checkpoint == "sonic_v1_1":
+        model_root = CHECKPOINT_SOURCE_ROOT / "models/v1.1"
+        default_config = model_root / "observation_config.yaml"
+        encoder_input = 1751
     else:
         model_root = CHECKPOINT_SOURCE_ROOT / "models/regular"
         default_config = (
@@ -804,7 +832,7 @@ def _probe_recording_adapters(args: argparse.Namespace, model: ModelFiles) -> No
         "--lookahead",
         str(args.lookahead),
         "--checkpoint-layout",
-        model.name,
+        _publisher_checkpoint_layout(model.name),
         "--regular-future-window",
         args.regular_future_window,
         (
@@ -1096,7 +1124,7 @@ def publisher_command(args: argparse.Namespace, run_dir: Path) -> list[str]:
         "--lookahead",
         str(args.lookahead),
         "--checkpoint-layout",
-        _normalise_checkpoint(args.checkpoint),
+        _publisher_checkpoint_layout(args.checkpoint),
         "--regular-future-window",
         args.regular_future_window,
         (
@@ -1222,7 +1250,7 @@ def _validate_launch_settings(
             )
     if args.chunk_size <= 0 or args.lookahead <= 0:
         raise PreflightError("--chunk-size and --lookahead must be positive")
-    required_future = 46 if model.name == "regular" else 10
+    required_future = _required_future_frames(model.name)
     available_future = min(args.chunk_size, args.lookahead)
     if available_future < required_future:
         raise PreflightError(
@@ -1244,12 +1272,12 @@ def _write_manifest(
 ) -> None:
     sequence, offset = _selected_reference_frame(args)
     recorded_window = args.regular_future_window == "recorded"
-    if model.name == "regular":
+    if model.name in ("regular", "sonic_v1_1"):
         encoder_lags = (
             report["recorded_slot_lag_inference"][
                 "future_slot_policy_lags"
             ]
-            if recorded_window
+            if model.name == "regular" and recorded_window
             else list(range(0, 50, 5))
         )
     else:
@@ -1281,7 +1309,7 @@ def _write_manifest(
                 "'none', the copied simulator applies an oracle hard alignment "
                 "from the original recording after each physics tick; otherwise "
                 "root_pos is audit-only. The active G1 mode-0 encoder inputs for "
-                "both checkpoints do not require root-z."
+                "the selected checkpoint do not require root-z."
             ),
             "task_object_state": (
                 "initialized from the selected source row, then physics-driven"
@@ -1670,7 +1698,17 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--checkpoint",
         default="low_latency",
-        choices=("regular", "sonic_release", "low_latency", "low", "low-latency"),
+        choices=(
+            "regular",
+            "sonic_release",
+            "low_latency",
+            "low",
+            "low-latency",
+            "sonic_v1_1",
+            "sonic-v1-1",
+            "v1.1",
+            "v1_1",
+        ),
         help="Checkpoint family (default: low_latency)",
     )
     parser.add_argument(

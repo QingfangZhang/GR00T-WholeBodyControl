@@ -22,12 +22,18 @@ def _sequence(frames: int = 60) -> SimpleNamespace:
     left = np.repeat((base + 2000.0)[:, None], 7, axis=1)
     right = np.repeat((base + 3000.0)[:, None], 7, axis=1)
     return SimpleNamespace(
+        csv_path="/tmp/test-recording/data.csv",
         policy_seq=np.arange(100, 100 + frames, dtype=np.int64),
+        source_row_index=np.arange(frames, dtype=np.int64),
+        source_csv_row_number=np.arange(2, 2 + frames, dtype=np.int64),
+        group_row_counts=np.full(frames, 8, dtype=np.int32),
         joint_pos=joint_pos,
         joint_vel=joint_vel,
+        root_pos=np.zeros((frames, 3), dtype=np.float32),
         root_quat_wxyz=root_quat,
         left_hand_target=left,
         right_hand_target=right,
+        joint_names=tuple(f"joint_{index}" for index in range(29)),
     )
 
 
@@ -208,6 +214,43 @@ class QposTrackPayloadTest(unittest.TestCase):
         self.assertNotIn("left_hand_joints", payload)
         self.assertNotIn("right_hand_joints", payload)
 
+    def test_sonic_v1_1_uses_canonical_step_five_absolute_quaternions(self) -> None:
+        sequence = _sequence()
+        sequence.root_quat_wxyz[:, 0] = np.arange(60, dtype=np.float32) + 4000.0
+        payload = build_pose_payload(
+            sequence,
+            current=3,
+            packet_frames=50,
+            include_hands=False,
+            checkpoint_layout="sonic_v1_1",
+        )
+        np.testing.assert_array_equal(payload["joint_pos"][:, 0], np.arange(3, 53))
+        np.testing.assert_array_equal(
+            payload["joint_pos"][np.arange(10) * 5, 0],
+            np.arange(3, 49, 5),
+        )
+        # The wire carries the recorded world-frame quaternion unchanged.  The
+        # v1.1 heading normalization is performed later by the local encoder.
+        np.testing.assert_array_equal(
+            payload["body_quat_w"][:, 0], np.arange(4003, 4053)
+        )
+        self.assertNotIn("token_state", payload)
+        self.assertNotIn("reference_motion", payload)
+
+    def test_sonic_v1_1_diagnostics_report_canonical_policy_lags(self) -> None:
+        args = publisher.build_parser().parse_args(
+            ["--checkpoint-layout", "sonic_v1_1"]
+        )
+        publisher._validate_args(args)
+        diagnostics = publisher._sequence_diagnostics(
+            _sequence(), args, full_frames=60
+        )
+        self.assertEqual(
+            diagnostics["encoder_source_policy_lags"],
+            [0, 5, 10, 15, 20, 25, 30, 35, 40, 45],
+        )
+        self.assertFalse(diagnostics["reference_motion_columns_used"])
+
     def test_tail_data_is_held_but_frame_index_remains_consecutive(self) -> None:
         payload = build_pose_payload(
             _sequence(12),
@@ -234,11 +277,44 @@ class QposTrackPayloadTest(unittest.TestCase):
                 checkpoint_layout="regular",
             )
 
+    def test_sonic_v1_1_rejects_short_packet(self) -> None:
+        with self.assertRaisesRegex(TrackPublisherError, "at least 46"):
+            build_pose_payload(
+                _sequence(),
+                current=0,
+                packet_frames=45,
+                include_hands=True,
+                checkpoint_layout="sonic_v1_1",
+            )
+
+    def test_sonic_v1_1_direct_api_rejects_recorded_lags(self) -> None:
+        with self.assertRaisesRegex(TrackPublisherError, "canonical encoder lags"):
+            build_pose_payload(
+                _sequence(),
+                current=0,
+                packet_frames=46,
+                include_hands=True,
+                checkpoint_layout="sonic_v1_1",
+                regular_future_lags=(0, 5, 9, 9, 9, 9, 9, 9, 9, 9),
+            )
+
     def test_recorded_window_rejects_low_latency_layout(self) -> None:
         args = publisher.build_parser().parse_args(
             [
                 "--checkpoint-layout",
                 "low_latency",
+                "--regular-future-window",
+                "recorded",
+            ]
+        )
+        with self.assertRaisesRegex(TrackPublisherError, "regular"):
+            publisher._validate_args(args)
+
+    def test_recorded_window_rejects_sonic_v1_1_layout(self) -> None:
+        args = publisher.build_parser().parse_args(
+            [
+                "--checkpoint-layout",
+                "sonic_v1_1",
                 "--regular-future-window",
                 "recorded",
             ]

@@ -77,6 +77,90 @@ class QposTrackLauncherTest(unittest.TestCase):
             ).resolve(),
         )
 
+        v11_args = launcher.build_parser().parse_args(
+            ["preflight", "--checkpoint", "sonic_v1_1", "--models-only"]
+        )
+        v11 = launcher.resolve_model_files(v11_args)
+        self.assertEqual(v11.name, "sonic_v1_1")
+        self.assertEqual(v11.expected_encoder_input, 1751)
+        self.assertEqual(v11.expected_decoder_input, 994)
+        self.assertEqual(v11.expected_token_dim, 64)
+        self.assertEqual(v11.expected_action_dim, 29)
+        self.assertEqual(
+            v11.encoder,
+            (
+                launcher.REPO_ROOT
+                / "change_ckpt/models/v1.1/model_encoder.onnx"
+            ).resolve(),
+        )
+        self.assertEqual(
+            v11.decoder,
+            (
+                launcher.REPO_ROOT
+                / "change_ckpt/models/v1.1/model_decoder.onnx"
+            ).resolve(),
+        )
+        self.assertEqual(
+            v11.obs_config,
+            (
+                launcher.REPO_ROOT
+                / "change_ckpt/models/v1.1/observation_config.yaml"
+            ).resolve(),
+        )
+
+    def test_sonic_v11_aliases_use_canonical_regular_publisher_layout(self) -> None:
+        parser = launcher.build_parser()
+        for alias in ("sonic_v1_1", "sonic-v1-1", "v1.1", "v1_1"):
+            with self.subTest(alias=alias):
+                args = parser.parse_args(
+                    ["run", "--checkpoint", alias, "--dry-run"]
+                )
+                self.assertEqual(
+                    launcher.resolve_model_files(args).name,
+                    "sonic_v1_1",
+                )
+                command = launcher.publisher_command(
+                    args, Path("/tmp/qpos-track-v11-test")
+                )
+                layout_index = command.index("--checkpoint-layout")
+                self.assertEqual(command[layout_index + 1], "sonic_v1_1")
+                window_index = command.index("--regular-future-window")
+                self.assertEqual(command[window_index + 1], "canonical")
+                self.assertEqual(
+                    launcher._required_future_frames(alias), 46
+                )
+
+    def test_sonic_v11_heading_observation_dimensions(self) -> None:
+        expected = {
+            "motion_anchor_orientation_heading_10frame_step5": 60,
+            "motion_anchor_orientation_heading_10frame_step1": 60,
+            "motion_anchor_orientation_heading": 6,
+            "smpl_anchor_orientation_heading_10frame_step1": 60,
+        }
+        for name, dimension in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    launcher.ENCODER_OBSERVATION_DIMS[name], dimension
+                )
+
+    def test_sonic_v11_rejects_recorded_future_window(self) -> None:
+        args = launcher.build_parser().parse_args(
+            [
+                "run",
+                "--checkpoint",
+                "sonic_v1_1",
+                "--regular-future-window",
+                "recorded",
+                "--dry-run",
+            ]
+        )
+        model = launcher.resolve_model_files(args)
+        with self.assertRaisesRegex(
+            launcher.PreflightError,
+            "valid only with --checkpoint regular",
+        ):
+            launcher._validate_launch_settings(args, model, {})
+
     def test_simulator_receives_actual_policy_seq_after_edge_trim(self) -> None:
         recording = (
             launcher.REPO_ROOT

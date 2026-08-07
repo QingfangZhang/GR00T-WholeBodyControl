@@ -1,8 +1,9 @@
-# qpos-track：在原任务场景中比较 regular 与 low-latency
+# qpos-track：在原任务场景中比较 regular、low-latency 与 SONIC v1.1
 
 这套工具把原 recording 中 regular checkpoint **实际走过的机器人状态**
 转换成 50 Hz 身体 reference，并在同一份任务场景、同一份身体 reference 和
-同一份手指 target 下，分别闭环运行 regular 与 low-latency checkpoint。
+同一份手指 target 下，分别闭环运行 regular、low-latency 和 SONIC v1.1
+checkpoint。
 
 原项目目录和 `change_ckpt/` 都不会被修改。新增代码位于
 `change_ckpt_track/`，持久化运行结果位于 `change_ckpt_track/data/`。
@@ -30,7 +31,7 @@
 它主要回答：
 
 > 面对 regular checkpoint 已成功（或实际）走过的同一条机器人身体轨迹，
-> low-latency checkpoint 能否稳定跟踪，并维持相同的手和物体交互？
+> 不同 checkpoint 能否稳定跟踪，并维持相同的手和物体交互？
 
 这条 reference 本身来自 regular 的实际 qpos，所以对 regular 存在来源优势。
 它是很有用的诊断实验，但不能单独替代“原始人体 retarget reference 下更换
@@ -56,10 +57,11 @@ checkpoint”的正式实验，也不能只凭一个 RMSE 数值认定语义任�
   `reference_motion`，且仅用于推断十个槽的时间 lag；实际发送的数值仍全部来自
   qpos/qvel/pelvis quaternion。
 
-publisher 默认每次发送 100 帧连续身体 reference。regular encoder 的最远
-前视是当前帧之后 45 帧；100 帧首包能在 CONTROL 启动和下一包合并之间保留
-足够余量，避免 50 帧首包曾出现的单周期边界 hold。比较器仍会逐帧审计
-duplicate/skip，不能仅凭配置假定播放严格同步。
+publisher 默认每次发送 100 帧连续身体 reference。regular 和 SONIC v1.1
+encoder 的最远前视是当前帧之后 45 帧，low-latency 使用连续 10 帧；100 帧
+首包能在 CONTROL 启动和下一包合并之间保留足够余量，避免 50 帧首包曾出现的
+单周期边界 hold。比较器仍会逐帧审计 duplicate/skip，不能仅凭配置假定播放
+严格同步。
 
 手控制与 29 维身体策略是两条不同链路：左右手 target 绕过 body
 encoder/decoder，直接作为外部手命令。它还是 **latest-value** 语义——每个
@@ -113,11 +115,15 @@ recording 中的任务场景和物体。
 还有一个当前 streamed protocol v1 的限制：虽然导出的 `body_pos.csv` 包含原
 qpos pelvis 位置，publisher 不会把它传给 C++。streamed `MotionSequence` 的
 `BodyPositions` 当前保持默认值（通常是零）。不过 C++ 的 mode filter 下，当前
-regular 和 low-latency 的 G1（mode 0）`required_observations` 都只有
-`encoder_mode`、29 关节位置/速度和 anchor orientation，不包含 root-z。因此，
-本次实际比较的 G1 640 维运动输入和 29 关节 tracking 指标不受 `body_pos`
-缺失影响。这个限制只影响非 G1 模式或完整 observation superset 的解释，并会
-记录在诊断和 manifest 中。
+regular、low-latency 和 SONIC v1.1 的 G1（mode 0）`required_observations`
+都只有 `encoder_mode`、29 关节位置/速度和 anchor orientation，不包含
+root-z。因此，本次实际比较的 G1 运动输入和 29 关节 tracking 指标不受
+`body_pos` 缺失影响。SONIC v1.1 使用新的
+`motion_anchor_orientation_heading_10frame_step5`：publisher 仍发送 recording
+中的世界系绝对四元数，C++ observation registry 再用机器人当前 heading 与
+reference orientation 计算相对旋转，并取旋转矩阵前两列作为每帧 6 维输入；
+不是由 Python publisher 预先篡改四元数。这个限制只影响非 G1 模式或完整
+observation superset 的解释，并会记录在诊断和 manifest 中。
 
 ## 1. 运行前检查
 
@@ -134,6 +140,10 @@ python change_ckpt_track/launch_checkpoint_rollout.py preflight \
 python change_ckpt_track/launch_checkpoint_rollout.py preflight \
   --checkpoint low_latency \
   --recording sample_data/ztj/20260612/20260612_144117_g1_sim
+
+python change_ckpt_track/launch_checkpoint_rollout.py preflight \
+  --checkpoint sonic_v1_1 \
+  --recording sample_data/ztj/20260612/20260612_144117_g1_sim
 ```
 
 默认模型是：
@@ -148,13 +158,22 @@ low_latency:
   change_ckpt/models/low_latency/model_encoder.onnx
   change_ckpt/models/low_latency/model_decoder.onnx
   change_ckpt/models/low_latency/observation_config.yaml
+
+sonic_v1_1:
+  change_ckpt/models/v1.1/model_encoder.onnx
+  change_ckpt/models/v1.1/model_decoder.onnx
+  change_ckpt/models/v1.1/observation_config.yaml
 ```
+
+SONIC v1.1 只允许 canonical step-5 窗口 `[0,5,10,...,45]`，不允许
+`--regular-future-window recorded`。首次运行会在同一模型目录生成 TensorRT
+cache；ONNX 原文件不会被移动或修改。
 
 如需使用其他文件，给 `preflight` 和 `run` 同时传
 `--encoder`、`--decoder`、`--obs-config`。`launch_manifest.json` 会记录实际
 模型路径和 SHA-256，之后不需要凭文件名猜测究竟跑了哪个 checkpoint。
 
-## 2. 分别实时运行两套 checkpoint
+## 2. 分别实时运行三套 checkpoint
 
 一次只运行一套。launcher 会统一启动任务 simulator、C++ deploy 和 qpos
 reference publisher；默认打开 MuJoCo viewer、自动完成 INIT/CONTROL/reference
@@ -173,6 +192,14 @@ low-latency：
 ```bash
 python change_ckpt_track/launch_checkpoint_rollout.py run \
   --checkpoint low_latency \
+  --recording sample_data/ztj/20260612/20260612_144117_g1_sim
+```
+
+SONIC v1.1：
+
+```bash
+python change_ckpt_track/launch_checkpoint_rollout.py run \
+  --checkpoint sonic_v1_1 \
   --recording sample_data/ztj/20260612/20260612_144117_g1_sim
 ```
 
@@ -196,6 +223,11 @@ python change_ckpt_track/launch_checkpoint_rollout.py run \
   --checkpoint low_latency \
   --recording sample_data/ztj/20260612/20260612_144117_g1_sim \
   --no-viewer
+
+python change_ckpt_track/launch_checkpoint_rollout.py run \
+  --checkpoint sonic_v1_1 \
+  --recording sample_data/ztj/20260612/20260612_144117_g1_sim \
+  --no-viewer
 ```
 
 输出目录固定为：
@@ -203,6 +235,7 @@ python change_ckpt_track/launch_checkpoint_rollout.py run \
 ```text
 change_ckpt_track/data/20260612_144117_g1_sim_regular/
 change_ckpt_track/data/20260612_144117_g1_sim_low_latency/
+change_ckpt_track/data/20260612_144117_g1_sim_sonic_v1_1/
 ```
 
 同一 recording 和 checkpoint 重复运行会覆盖对应的同名目录，不使用时间戳。
@@ -403,7 +436,27 @@ change_ckpt_track/data/20260612_144117_g1_sim_comparison/
 `ordinal_target_max_abs_difference_rad`，用于暴露未校正前因重复/漏帧造成的
 ordinal target 差异。
 
-## 5. replay 两次结果
+### 汇总多套 rollout
+
+`summarize_checkpoint_rollouts.py` 是只读工具，可同时汇总任意数量的
+regular、low-latency 和 SONIC v1.1 结果：
+
+```bash
+.venv_sim/bin/python change_ckpt_track/summarize_checkpoint_rollouts.py \
+  --scan-root change_ckpt_track/data/sonic_v1_1_comparison
+```
+
+它分别报告：
+
+- 29-DoF 实测关节相对本次 `target_motion.csv` 的 tracking 误差；
+- rollout pelvis 相对原 recording 同一 source-row 的 XY/XYZ/yaw 误差；
+- `run_metadata.json` 中任务物体的物理终态。
+
+加 `--json` 可得到完整机器可读结果。root-assist 覆盖的坐标会明确标成 oracle，
+其接近零的误差不是 checkpoint 自身性能；任务物体终态也只是物理指标，不能自动
+等同于抓取、放置或稳定站立成功。
+
+## 5. replay 结果
 
 replay binary 仍依赖你单独准备的 MuJoCo 3.2 动态库环境，不使用
 `.venv_sim` 中的 MuJoCo 3.10：
@@ -414,6 +467,9 @@ replay binary 仍依赖你单独准备的 MuJoCo 3.2 动态库环境，不使用
 
 ./sample_data/ztj/replay_mujoco_csv \
   change_ckpt_track/data/20260612_144117_g1_sim_low_latency
+
+./sample_data/ztj/replay_mujoco_csv \
+  change_ckpt_track/data/20260612_144117_g1_sim_sonic_v1_1
 ```
 
 replay 只按新的 `data.csv` qpos 展示仿真结果；它适合逐段查看机器人和任务
@@ -447,6 +503,10 @@ replay 只按新的 `data.csv` qpos 展示仿真结果；它适合逐段查看�
 
 .venv_replay/bin/python change_ckpt_track/replay_mujoco_compare.py \
   change_ckpt_track/data/20260720_144342_g1_sim_low_latency
+
+# 本次 SONIC v1.1 专用输出根目录中的结果
+.venv_replay/bin/python change_ckpt_track/replay_mujoco_compare.py \
+  change_ckpt_track/data/sonic_v1_1_comparison/20260720_144342_g1_sim_sonic_v1_1_root_assist_xy
 ```
 
 如果 sidecar 中的旧路径已失效，viewer 会按 recording 目录名在
