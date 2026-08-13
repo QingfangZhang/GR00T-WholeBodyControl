@@ -8,7 +8,7 @@ normal sim2sim path.
 Typical use (the subscriber/deploy process must already be running)::
 
     .venv_sim/bin/python change_ckpt/csv_reference_publisher.py \
-        --input sample_data/ztj/20260720_144342_g1_sim
+        --input sample_data/ztj/20260612/20260720_144342_g1_sim
 
 Use ``--dry-run`` first to inspect policy deduplication, future-frame lags and
 the absolute-orientation reconstruction without opening a network socket.
@@ -63,8 +63,9 @@ PUBLISHES_EXTERNAL_TOKEN = False
 HEADER_SIZE = 1280
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT = REPO_ROOT / "sample_data/ztj/20260720_144342_g1_sim"
+DEFAULT_INPUT = REPO_ROOT / "sample_data/ztj/20260612/20260720_144342_g1_sim"
 REGULAR_PACKET_SLOT_OFFSETS = np.arange(10, dtype=np.int64) * 5
+RECORDED_SLOT_LAYOUTS = ("regular", "sonic_v1_1")
 
 
 def _import_wire_helpers() -> tuple[Any, Any]:
@@ -129,10 +130,10 @@ def build_pose_payload(
 ) -> dict[str, np.ndarray]:
     """Build one rolling, local-encoder protocol-v1 payload."""
 
-    if checkpoint_layout == "regular":
+    if checkpoint_layout in RECORDED_SLOT_LAYOUTS:
         if packet_frames <= int(REGULAR_PACKET_SLOT_OFFSETS[-1]):
             raise ReferenceDataError(
-                "regular recorded-slot replay needs packet_frames >= 46"
+                f"{checkpoint_layout} recorded-slot replay needs packet_frames >= 46"
             )
         positions, velocities, absolute_quat = (
             reference_slot_views(sequence) if regular_slots is None else regular_slots
@@ -247,15 +248,17 @@ def run_publisher(args: argparse.Namespace, sequence: ReferenceSequence) -> int:
     packet_frames = min(args.chunk_size, args.lookahead)
     if packet_frames < 10:
         raise ReferenceDataError(
-            f"rolling packet has only {packet_frames} frames; both checkpoints need at least 10"
+            f"rolling packet has only {packet_frames} frames; all layouts need at least 10"
         )
-    if args.checkpoint_layout == "regular" and packet_frames < 46:
+    if args.checkpoint_layout in RECORDED_SLOT_LAYOUTS and packet_frames < 46:
         raise ReferenceDataError(
-            "regular step-5 encoder needs current..current+45; use --chunk-size and "
-            "--lookahead values of at least 46"
+            f"{args.checkpoint_layout} step-5 encoder needs current..current+45; "
+            "use --chunk-size and --lookahead values of at least 46"
         )
     regular_slots = (
-        reference_slot_views(sequence) if args.checkpoint_layout == "regular" else None
+        reference_slot_views(sequence)
+        if args.checkpoint_layout in RECORDED_SLOT_LAYOUTS
+        else None
     )
 
     context = zmq.Context()
@@ -444,9 +447,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--checkpoint-layout",
-        choices=("regular", "low_latency", "auto"),
-        default="auto",
-        help="Use regular to enforce its 46-frame step-5 look-ahead requirement",
+        choices=("regular", "low_latency", "sonic_v1_1"),
+        default="low_latency",
+        help=(
+            "Use regular or sonic_v1_1 for the exact recorded ten-slot, "
+            "step-5 reference window; default: low_latency rolling window"
+        ),
     )
     parser.add_argument(
         "--base-sample",
@@ -579,7 +585,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "reference_window_semantics": (
                 "recorded CSV slots tiled by five row residues; each row is sampled "
                 "at packet-local offsets 0,5,...,45"
-                if args.checkpoint_layout == "regular"
+                if args.checkpoint_layout in RECORDED_SLOT_LAYOUTS
                 else "consecutive deduplicated policy frames at offsets 0..9"
             ),
         }

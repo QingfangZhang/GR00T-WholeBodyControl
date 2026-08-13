@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 import numpy as np
@@ -19,7 +21,9 @@ if str(CHANGE_CKPT_TRACK_DIR) not in sys.path:
 
 from change_ckpt_track.run_task_sim_loop import (  # noqa: E402
     _apply_source_root_assist,
+    build_parser,
 )
+from change_ckpt_track.task_sim_io import CsvTimeline  # noqa: E402
 
 
 class SourceRootAssistTest(unittest.TestCase):
@@ -122,6 +126,74 @@ class SourceRootAssistTest(unittest.TestCase):
                 np.testing.assert_array_equal(
                     values["qvel"], original_qvel, strict=True
                 )
+
+
+class InitialStateOverrideTest(unittest.TestCase):
+    def _timeline(self) -> tuple[tempfile.TemporaryDirectory[str], CsvTimeline]:
+        temporary = tempfile.TemporaryDirectory()
+        csv_path = Path(temporary.name) / "data.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(
+                [
+                    "policy_seq",
+                    "qpos:pelvis.floating_base_joint.x[qpos0]",
+                    "joint[qpos1]",
+                    "pelvis.x[qvel0]",
+                ]
+            )
+            writer.writerow([10, 1.0, 2.0, 3.0])
+            writer.writerow([10, 4.0, 5.0, 6.0])
+        return temporary, CsvTimeline(
+            csv_path, policy_seq=None, row_index=0, policy_offset=None
+        )
+
+    def test_override_changes_only_selected_initial_row(self) -> None:
+        temporary, timeline = self._timeline()
+        self.addCleanup(temporary.cleanup)
+        self.addCleanup(timeline.close)
+
+        timeline.override_initial_state([11.0, 12.0], [13.0])
+        qpos, qvel = timeline.state()
+        np.testing.assert_array_equal(qpos, [11.0, 12.0])
+        np.testing.assert_array_equal(qvel, [13.0])
+
+        self.assertTrue(timeline.advance())
+        qpos, qvel = timeline.state()
+        np.testing.assert_array_equal(qpos, [4.0, 5.0])
+        np.testing.assert_array_equal(qvel, [6.0])
+
+    def test_override_rejects_bad_shape_without_mutating_state(self) -> None:
+        temporary, timeline = self._timeline()
+        self.addCleanup(temporary.cleanup)
+        self.addCleanup(timeline.close)
+        expected = timeline.state()
+
+        with self.assertRaisesRegex(ValueError, "initial qpos override shape"):
+            timeline.override_initial_state([11.0], [13.0])
+
+        actual = timeline.state()
+        np.testing.assert_array_equal(actual[0], expected[0])
+        np.testing.assert_array_equal(actual[1], expected[1])
+
+    def test_override_rejects_nonfinite_values_without_mutating_state(self) -> None:
+        temporary, timeline = self._timeline()
+        self.addCleanup(temporary.cleanup)
+        self.addCleanup(timeline.close)
+        expected = timeline.state()
+
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            timeline.override_initial_state([11.0, np.nan], [13.0])
+
+        actual = timeline.state()
+        np.testing.assert_array_equal(actual[0], expected[0])
+        np.testing.assert_array_equal(actual[1], expected[1])
+
+    def test_parser_accepts_initial_state_json(self) -> None:
+        args = build_parser().parse_args(
+            ["recording", "--initial-state-json", "initial-state.json"]
+        )
+        self.assertEqual(args.initial_state_json, Path("initial-state.json"))
 
 
 if __name__ == "__main__":

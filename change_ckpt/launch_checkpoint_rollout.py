@@ -51,18 +51,73 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable, Sequence
 
+try:
+    from .source_history_prefill import (
+        SourceHistoryError,
+        build_source_history_prefill,
+        summary as source_history_summary,
+        write_source_history_prefill,
+    )
+except ImportError:  # Direct ``python change_ckpt/launch_...py`` execution.
+    from source_history_prefill import (  # type: ignore[no-redef]
+        SourceHistoryError,
+        build_source_history_prefill,
+        summary as source_history_summary,
+        write_source_history_prefill,
+    )
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CHANGE_ROOT = REPO_ROOT / "change_ckpt"
-DEFAULT_RECORDING = REPO_ROOT / "sample_data/ztj/20260720_144342_g1_sim"
+DEFAULT_RECORDING = (
+    REPO_ROOT / "sample_data/ztj/20260612/20260720_144342_g1_sim"
+)
 DEFAULT_DATA_ROOT = CHANGE_ROOT / "data"
 DEPLOY_ROOT = REPO_ROOT / "gear_sonic_deploy"
 DEPLOY_BINARY = DEPLOY_ROOT / "target/release/g1_deploy_onnx_ref"
+SOURCE_HISTORY_DEPLOY_BINARY = (
+    CHANGE_ROOT / "bin/g1_deploy_onnx_ref_source_history"
+)
+SOURCE_HISTORY_BUILD_MANIFEST = (
+    CHANGE_ROOT / "build/source_history_deploy/build_manifest.json"
+)
+SOURCE_HISTORY_TRACKED_BUILD_INPUTS = {
+    "wrapper_source": (
+        CHANGE_ROOT
+        / "source_history_deploy/g1_deploy_onnx_ref_source_history.cpp"
+    ),
+    "official_source": (
+        DEPLOY_ROOT
+        / "src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp"
+    ),
+    "state_logger_header": (
+        DEPLOY_ROOT / "src/g1/g1_deploy_onnx_ref/include/state_logger.hpp"
+    ),
+    "policy_parameters_header": (
+        DEPLOY_ROOT
+        / "src/g1/g1_deploy_onnx_ref/include/policy_parameters.hpp"
+    ),
+    "compile_database": DEPLOY_ROOT / "build/compile_commands.json",
+    "link_file": (
+        DEPLOY_ROOT
+        / "build/src/g1/g1_deploy_onnx_ref/"
+        "CMakeFiles/g1_deploy_onnx_ref.dir/link.txt"
+    ),
+}
 SIM_SCRIPT = CHANGE_ROOT / "run_task_sim_loop.py"
 PUBLISHER_SCRIPT = CHANGE_ROOT / "csv_reference_publisher.py"
 SIM_PYTHON = REPO_ROOT / ".venv_sim/bin/python"
 REFERENCE_FALLBACK = DEPLOY_ROOT / "reference/example"
 PLANNER_MODEL = CHANGE_ROOT / "models/planner/target_vel/V2/planner_sonic.onnx"
+
+# User-facing offsets deliberately ignore the first raw policy_seq group.  That
+# group may be either complete or truncated depending on when logging started;
+# defining the second raw group as offset 0 makes every recording use one stable
+# convention.  The default offset 10 therefore selects raw group 11 (the 12th
+# group in the CSV), matching the common takeover point used by the prefill
+# experiments while leaving ample preceding source history.
+POLICY_OFFSET_RAW_BASE = 1
+DEFAULT_START_POLICY_OFFSET = 10
 
 # ``--sim-frequency`` selects a tested control/physics timing pair.  The source
 # recording and streamed policy keep their own clocks (400 Hz and 50 Hz).
@@ -81,6 +136,13 @@ OBSERVATION_DIMS: dict[str, int] = {
     "his_last_actions_10frame_step1": 290,
     "his_gravity_dir_10frame_step1": 30,
 }
+SOURCE_HISTORY_POLICY_OBSERVATIONS = tuple(OBSERVATION_DIMS)
+
+
+def _raw_start_policy_offset(args: argparse.Namespace) -> int:
+    """Translate the public second-group-based offset to a raw group index."""
+
+    return int(args.start_policy_offset) + POLICY_OFFSET_RAW_BASE
 
 ENCODER_OBSERVATION_DIMS: dict[str, int] = {
     "encoder_mode": 3,
@@ -91,6 +153,9 @@ ENCODER_OBSERVATION_DIMS: dict[str, int] = {
     "motion_joint_positions_10frame_step1": 290,
     "motion_joint_velocities_10frame_step1": 290,
     "motion_anchor_orientation_10frame_step1": 60,
+    "motion_anchor_orientation_heading_10frame_step5": 60,
+    "motion_anchor_orientation_heading_10frame_step1": 60,
+    "motion_anchor_orientation_heading": 6,
     "motion_anchor_orientation": 6,
     "motion_joint_positions_lowerbody_10frame_step5": 120,
     "motion_joint_velocities_lowerbody_10frame_step5": 120,
@@ -100,6 +165,7 @@ ENCODER_OBSERVATION_DIMS: dict[str, int] = {
     "vr_3point_local_orn_target": 12,
     "smpl_joints_10frame_step1": 720,
     "smpl_anchor_orientation_10frame_step1": 60,
+    "smpl_anchor_orientation_heading_10frame_step1": 60,
     "motion_joint_positions_wrists_10frame_step1": 60,
     "smpl_joints_4frame_step1": 288,
     "smpl_anchor_orientation_4frame_step1": 24,
@@ -224,6 +290,11 @@ def _normalise_checkpoint(name: str) -> str:
         "low": "low_latency",
         "low-latency": "low_latency",
         "low_latency": "low_latency",
+        "sonic_v1_1": "sonic_v1_1",
+        "sonic-v1-1": "sonic_v1_1",
+        "sonic-v1.1": "sonic_v1_1",
+        "v1.1": "sonic_v1_1",
+        "v1_1": "sonic_v1_1",
     }
     try:
         return aliases[name]
@@ -247,6 +318,11 @@ def resolve_model_files(args: argparse.Namespace) -> ModelFiles:
         default_decoder = CHANGE_ROOT / "models/low_latency/model_decoder.onnx"
         default_config = CHANGE_ROOT / "models/low_latency/observation_config.yaml"
         encoder_input = 1247
+    elif checkpoint == "sonic_v1_1":
+        default_encoder = CHANGE_ROOT / "models/v1.1/model_encoder.onnx"
+        default_decoder = CHANGE_ROOT / "models/v1.1/model_decoder.onnx"
+        default_config = CHANGE_ROOT / "models/v1.1/observation_config.yaml"
+        encoder_input = 1751
     else:
         default_encoder = CHANGE_ROOT / "models/regular/model_encoder.onnx"
         default_decoder = CHANGE_ROOT / "models/regular/model_decoder.onnx"
@@ -641,11 +717,97 @@ def _validate_recording(recording: Path) -> dict[str, Any]:
     }
 
 
-def _check_deploy_binary() -> dict[str, Any]:
-    if not DEPLOY_BINARY.is_file() or not os.access(DEPLOY_BINARY, os.X_OK):
+def _selected_deploy_binary(args: argparse.Namespace) -> Path:
+    if (
+        getattr(args, "source_history_prefill", False)
+        or getattr(args, "source_state_init", False)
+    ):
+        return SOURCE_HISTORY_DEPLOY_BINARY
+    return DEPLOY_BINARY
+
+
+def _uses_source_state_alignment(args: argparse.Namespace) -> bool:
+    """Whether MuJoCo must start at the source policy's measured-state phase."""
+
+    return bool(
+        getattr(args, "source_history_prefill", False)
+        or getattr(args, "source_state_init", False)
+    )
+
+
+def _validate_source_history_build(deploy_binary: Path) -> dict[str, Any]:
+    rebuild_hint = (
+        ".venv_sim/bin/python change_ckpt/build_source_history_deploy.py"
+    )
+    if not SOURCE_HISTORY_BUILD_MANIFEST.is_file():
         raise PreflightError(
-            f"Deploy executable is missing: {DEPLOY_BINARY}\n"
-            "Build it from gear_sonic_deploy before running this experiment."
+            "Source-history deploy build manifest is missing; rebuild it with:\n"
+            f"  {rebuild_hint}"
+        )
+    try:
+        payload = json.loads(
+            SOURCE_HISTORY_BUILD_MANIFEST.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PreflightError(
+            "Cannot read the source-history deploy build manifest; rebuild it with:\n"
+            f"  {rebuild_hint}\n({exc})"
+        ) from exc
+
+    mismatches: list[str] = []
+    if Path(str(payload.get("output", ""))).resolve() != deploy_binary.resolve():
+        mismatches.append("output path")
+    elif payload.get("output_sha256") != _sha256(deploy_binary):
+        mismatches.append("output binary hash")
+
+    official_binary = DEPLOY_BINARY.resolve()
+    if payload.get("official_binary_sha256") != _sha256(official_binary):
+        mismatches.append("official deploy binary hash")
+
+    recorded_inputs = payload.get("tracked_build_inputs")
+    if not isinstance(recorded_inputs, dict):
+        mismatches.append("tracked build-input metadata")
+    else:
+        for name, expected_path in SOURCE_HISTORY_TRACKED_BUILD_INPUTS.items():
+            expected_path = expected_path.resolve()
+            item = recorded_inputs.get(name)
+            if not isinstance(item, dict):
+                mismatches.append(f"{name} metadata")
+                continue
+            if Path(str(item.get("path", ""))).resolve() != expected_path:
+                mismatches.append(f"{name} path")
+                continue
+            if not expected_path.is_file() or item.get("sha256") != _sha256(
+                expected_path
+            ):
+                mismatches.append(f"{name} hash")
+
+    if mismatches:
+        raise PreflightError(
+            "Source-history deploy is stale or does not match this checkout "
+            f"({', '.join(mismatches)}). Rebuild it with:\n  {rebuild_hint}"
+        )
+    return {
+        "manifest": str(SOURCE_HISTORY_BUILD_MANIFEST.resolve()),
+        "manifest_sha256": _sha256(SOURCE_HISTORY_BUILD_MANIFEST),
+        "tracked_inputs": sorted(SOURCE_HISTORY_TRACKED_BUILD_INPUTS),
+        "status": "current",
+    }
+
+
+def _check_deploy_binary(args: argparse.Namespace) -> dict[str, Any]:
+    deploy_binary = _selected_deploy_binary(args)
+    if not deploy_binary.is_file() or not os.access(deploy_binary, os.X_OK):
+        build_hint = (
+            "Run: .venv_sim/bin/python change_ckpt/build_source_history_deploy.py"
+            if (
+                getattr(args, "source_history_prefill", False)
+                or getattr(args, "source_state_init", False)
+            )
+            else "Build it from gear_sonic_deploy before running this experiment."
+        )
+        raise PreflightError(
+            f"Deploy executable is missing: {deploy_binary}\n{build_hint}"
         )
     if not PLANNER_MODEL.is_file():
         raise PreflightError(
@@ -653,7 +815,7 @@ def _check_deploy_binary() -> dict[str, Any]:
             f"mode, but it is missing: {PLANNER_MODEL}"
         )
     completed = subprocess.run(
-        ["ldd", str(DEPLOY_BINARY)],
+        ["ldd", str(deploy_binary)],
         cwd=REPO_ROOT,
         text=True,
         stdout=subprocess.PIPE,
@@ -666,11 +828,18 @@ def _check_deploy_binary() -> dict[str, Any]:
         raise PreflightError(
             f"Deploy executable has unresolved shared libraries:\n  " + "\n  ".join(missing or [completed.stdout.strip()])
         )
-    return {
-        "deploy_binary": str(DEPLOY_BINARY),
+    result = {
+        "deploy_binary": str(deploy_binary),
+        "deploy_binary_sha256": _sha256(deploy_binary),
+        "source_history_variant": deploy_binary == SOURCE_HISTORY_DEPLOY_BINARY,
         "planner_model": str(PLANNER_MODEL),
         "shared_libraries": "resolved",
     }
+    if deploy_binary == SOURCE_HISTORY_DEPLOY_BINARY:
+        result["source_history_build"] = _validate_source_history_build(
+            deploy_binary
+        )
+    return result
 
 
 def _check_port_available(port: int) -> None:
@@ -701,6 +870,7 @@ def _runtime_conflicts() -> list[dict[str, Any]]:
     """Find old simulator/deploy processes that would share DDS or ZMQ state."""
     watched = {
         "g1_deploy_onnx_ref",
+        "g1_deploy_onnx_ref_source_history",
         "run_sim_loop.py",
         "run_task_sim_loop.py",
         "csv_reference_publisher.py",
@@ -752,7 +922,7 @@ def _probe_recording_adapters(args: argparse.Namespace, model: ModelFiles) -> No
         str(SIM_SCRIPT),
         str(_absolute(Path(args.recording))),
         "--policy-offset",
-        str(args.start_policy_offset),
+        str(_raw_start_policy_offset(args)),
         "--physics-dt",
         str(args.physics_dt),
         "--control-dt",
@@ -778,7 +948,7 @@ def _probe_recording_adapters(args: argparse.Namespace, model: ModelFiles) -> No
         "--rate",
         str(args.reference_rate),
         "--start-policy-offset",
-        str(args.start_policy_offset),
+        str(_raw_start_policy_offset(args)),
         "--chunk-size",
         str(args.chunk_size),
         "--lookahead",
@@ -831,6 +1001,7 @@ def run_preflight(args: argparse.Namespace, *, include_adapters: bool = True) ->
             "--save-csv",
             "--viewer",
             "--root-assist",
+            "--initial-state-json",
         ),
     )
     _probe_help(
@@ -845,7 +1016,34 @@ def run_preflight(args: argparse.Namespace, *, include_adapters: bool = True) ->
             "--lookahead",
         ),
     )
-    report["deploy"] = _check_deploy_binary()
+    report["deploy"] = _check_deploy_binary(args)
+    if getattr(args, "source_history_prefill", False):
+        policy_observations = tuple(report["model"]["policy_observations"])
+        if policy_observations != SOURCE_HISTORY_POLICY_OBSERVATIONS:
+            raise PreflightError(
+                "Source-history prefill supports exactly the current SONIC "
+                "token + base-angular-velocity/body-q/body-dq/last-action/"
+                "gravity decoder layout; got: "
+                + ", ".join(policy_observations)
+            )
+    if _uses_source_state_alignment(args):
+        try:
+            prefill = build_source_history_prefill(
+                recording,
+                start_policy_offset=_raw_start_policy_offset(args),
+            )
+        except SourceHistoryError as exc:
+            raise PreflightError(f"Source-state reconstruction is invalid: {exc}") from exc
+        args.source_history_prefill_payload = prefill
+        selection = {
+            **source_history_summary(prefill),
+            "launcher_public_policy_offset": int(args.start_policy_offset),
+            "raw_policy_group_offset": _raw_start_policy_offset(args),
+            "launcher_offset_origin_raw_group": POLICY_OFFSET_RAW_BASE,
+        }
+        report["source_state_alignment"] = selection
+        if getattr(args, "source_history_prefill", False):
+            report["source_history_prefill"] = selection
     if hasattr(args, "control_dt"):
         _probe_recording_adapters(args, model)
         report["adapter_dry_run"] = {
@@ -908,6 +1106,10 @@ def deploy_command(args: argparse.Namespace, model: ModelFiles, logs_dir: Path) 
         "--zmq-host",
         "--zmq-port",
         "--zmq-topic",
+        "--enable-csv-logs",
+        "--logs-dir",
+        "--target-motion-logfile",
+        "--source-history-prefill-file",
     )
     if any(item == option or item.startswith(option + "=") for item in args.deploy_arg for option in locked):
         raise PreflightError(
@@ -915,7 +1117,7 @@ def deploy_command(args: argparse.Namespace, model: ModelFiles, logs_dir: Path) 
             "those are locked to preserve local-encoder and stream-alignment semantics"
         )
     command = [
-        str(DEPLOY_BINARY),
+        str(_selected_deploy_binary(args)),
         _network_interface(),
         str(model.decoder),
         str(REFERENCE_FALLBACK),
@@ -941,12 +1143,27 @@ def deploy_command(args: argparse.Namespace, model: ModelFiles, logs_dir: Path) 
         "--zmq-topic",
         args.topic,
         "--disable-crc-check",
-        "--enable-csv-logs",
-        "--logs-dir",
-        str(logs_dir),
-        "--target-motion-logfile",
-        str(logs_dir.parent / "target_motion.csv"),
     ]
+    if getattr(args, "source_history_prefill", False):
+        prefill_file = getattr(args, "source_history_prefill_file", None)
+        if prefill_file is None:
+            raise PreflightError(
+                "source-history prefill file was not prepared before building "
+                "the deploy command"
+            )
+        command.extend(
+            ["--source-history-prefill-file", str(Path(prefill_file).resolve())]
+        )
+    if getattr(args, "deploy_csv_logs", True):
+        command.extend(
+            [
+                "--enable-csv-logs",
+                "--logs-dir",
+                str(logs_dir),
+                "--target-motion-logfile",
+                str(logs_dir.parent / "target_motion.csv"),
+            ]
+        )
     command.extend(args.deploy_arg)
     return command
 
@@ -969,6 +1186,7 @@ def simulator_command(args: argparse.Namespace, run_dir: Path) -> list[str]:
         "--control-dt",
         "--source-dt",
         "--root-assist",
+        "--initial-state-json",
         "--physics-dt",
         "--viewer-dt",
         "--fall-height",
@@ -1004,10 +1222,36 @@ def simulator_command(args: argparse.Namespace, run_dir: Path) -> list[str]:
         "--gate-status-file",
         str(run_dir / "control_gate.status"),
     ]
-    # The single shared offset is intentionally passed to both simulator and
-    # publisher; exposing separate row/sequence selectors here could silently
-    # start physics and reference streaming at different points.
-    command.extend(["--policy-offset", str(args.start_policy_offset)])
+    # Normal runs use one shared policy offset.  Source-state-aligned diagnostics
+    # are the deliberate exception: the original policy packet reached the CSV logger
+    # about 10 ms after the state it describes, so physics starts from the
+    # measured-state-matched source row while the publisher starts at the
+    # requested policy offset.  The generated manifest records both clocks.
+    if _uses_source_state_alignment(args):
+        initial_state_file = getattr(args, "source_history_initial_state_file", None)
+        if initial_state_file is None:
+            raise PreflightError(
+                "source-history initial state was not prepared before building "
+                "the simulator command"
+            )
+        sim_row_index = getattr(args, "source_history_sim_row_index", None)
+        if sim_row_index is None:
+            raise PreflightError(
+                "source-history simulator row was not prepared before building "
+                "the simulator command"
+            )
+        command.extend(
+            [
+                "--row-index",
+                str(sim_row_index),
+                "--initial-state-json",
+                str(Path(initial_state_file).resolve()),
+            ]
+        )
+    else:
+        command.extend(
+            ["--policy-offset", str(_raw_start_policy_offset(args))]
+        )
     if args.asset_model_root:
         command.extend(["--asset-model-root", str(_absolute(Path(args.asset_model_root)))])
     command.extend(args.sim_arg)
@@ -1058,7 +1302,7 @@ def publisher_command(args: argparse.Namespace, run_dir: Path) -> list[str]:
         "--rate",
         str(args.reference_rate),
         "--start-policy-offset",
-        str(args.start_policy_offset),
+        str(_raw_start_policy_offset(args)),
         "--chunk-size",
         str(args.chunk_size),
         "--lookahead",
@@ -1082,6 +1326,70 @@ def publisher_command(args: argparse.Namespace, run_dir: Path) -> list[str]:
     return command
 
 
+def _prepare_source_history_file(
+    args: argparse.Namespace, run_dir: Path
+) -> dict[str, Any] | None:
+    if not _uses_source_state_alignment(args):
+        return None
+    payload = getattr(args, "source_history_prefill_payload", None)
+    if payload is None:
+        try:
+            payload = build_source_history_prefill(
+                args.recording,
+                start_policy_offset=_raw_start_policy_offset(args),
+            )
+        except SourceHistoryError as exc:
+            raise PreflightError(
+                f"Source-state reconstruction is invalid: {exc}"
+            ) from exc
+    source_csv = Path(payload["source_csv"])
+    if _sha256(source_csv) != payload["source_csv_sha256"]:
+        raise PreflightError(
+            f"Source CSV changed after preflight; refusing mixed provenance: {source_csv}"
+        )
+    payload_name = (
+        "source_history_prefill.json"
+        if getattr(args, "source_history_prefill", False)
+        else "source_state_alignment.json"
+    )
+    path = write_source_history_prefill(payload, run_dir / payload_name)
+    args.source_state_alignment_file = path
+    if getattr(args, "source_history_prefill", False):
+        args.source_history_prefill_file = path
+    initial_state_path = run_dir / "source_history_initial_state.json"
+    initial_state_path.write_text(
+        json.dumps(
+            {
+                "format": "g1_source_history_initial_state",
+                "version": 1,
+                "source_csv": payload["source_csv"],
+                "source_csv_sha256": payload["source_csv_sha256"],
+                "policy_seq": payload["current"]["policy_seq"],
+                "policy_boundary_row_index": payload["current"][
+                    "source_row_index"
+                ],
+                "matched_source_row_index": payload["current"][
+                    "matched_source_row_index"
+                ],
+                "matched_control_time_s": payload["current"][
+                    "matched_control_time_s"
+                ],
+                "qpos": payload["current"]["sim_initial_qpos"],
+                "qvel": payload["current"]["sim_initial_qvel"],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    args.source_history_initial_state_file = initial_state_path
+    args.source_history_sim_row_index = payload["current"][
+        "matched_source_row_index"
+    ]
+    return payload
+
+
 def _new_run_dir(args: argparse.Namespace, checkpoint: str) -> Path:
     root = _absolute(Path(args.output_root))
     root.mkdir(parents=True, exist_ok=True)
@@ -1096,6 +1404,8 @@ def _new_run_dir(args: argparse.Namespace, checkpoint: str) -> Path:
     sim_frequency = _selected_sim_frequency(args)
     if sim_frequency != 200:
         suffix_parts.append(f"{sim_frequency}hz")
+    if not getattr(args, "deploy_csv_logs", True):
+        suffix_parts.append("no_deploy_csv")
     if assist != "none":
         suffix_parts.extend(("root_assist", assist))
     suffix = "_".join(suffix_parts)
@@ -1127,6 +1437,14 @@ def _validate_launch_settings(
         raise PreflightError(f"Invalid ZMQ port: {args.port}")
     if args.start_policy_offset < 0:
         raise PreflightError("--start-policy-offset must be non-negative")
+    if (
+        getattr(args, "source_history_prefill", False)
+        and getattr(args, "source_state_init", False)
+    ):
+        raise PreflightError(
+            "--source-history-prefill already includes source-state initialization; "
+            "do not combine it with --source-state-init"
+        )
     positive = {
         "--control-dt": args.control_dt,
         "--source-dt": args.source_dt,
@@ -1160,7 +1478,7 @@ def _validate_launch_settings(
             )
     if args.chunk_size <= 0 or args.lookahead <= 0:
         raise PreflightError("--chunk-size and --lookahead must be positive")
-    required_future = 46 if model.name == "regular" else 10
+    required_future = 46 if model.name in ("regular", "sonic_v1_1") else 10
     available_future = min(args.chunk_size, args.lookahead)
     if available_future < required_future:
         raise PreflightError(
@@ -1186,10 +1504,80 @@ def _write_manifest(
         "protocol": {"version": 1, "external_token": False},
         "initialization": {
             "policy_offset": args.start_policy_offset,
+            "launcher_public_policy_offset": args.start_policy_offset,
+            "policy_offset_semantics": (
+                "zero-based from the second raw policy_seq group"
+            ),
+            "launcher_offset_origin_raw_group": POLICY_OFFSET_RAW_BASE,
+            "raw_policy_group_offset": _raw_start_policy_offset(args),
             "gate_file": str(run_dir / "control_gate.status"),
             "publisher_gate_file": str(run_dir / "publisher.status"),
-            "history_mode": "cpp_state_logger_zero_fill_until_10_control_frames_exist",
-            "warmup_exclusion_s": 0.2,
+            "history_mode": (
+                "source_csv_previous_9_plus_first_live_current"
+                if getattr(args, "source_history_prefill", False)
+                else "cpp_state_logger_zero_fill_until_10_control_frames_exist"
+            ),
+            "warmup_exclusion_s": (
+                0.2
+            ),
+            "decoder_zero_padding_duration_s": (
+                0.0 if getattr(args, "source_history_prefill", False) else 0.2
+            ),
+            "warmup_note": (
+                "The 0.2 s generic startup window is retained for steady-state "
+                "comparisons. Source-history prefill removes decoder zero padding, "
+                "but not first-tick heading/encoder/publisher transients."
+            ),
+            "source_history_prefill": (
+                {
+                    **report["source_history_prefill"],
+                    "file": str(
+                        Path(args.source_history_prefill_file).resolve()
+                    ),
+                    "file_sha256": _sha256(
+                        Path(args.source_history_prefill_file).resolve()
+                    ),
+                    "initial_state_file": str(
+                        Path(args.source_history_initial_state_file).resolve()
+                    ),
+                    "initial_state_file_sha256": _sha256(
+                        Path(args.source_history_initial_state_file).resolve()
+                    ),
+                    "first_live_last_action": (
+                        "source current policy_last_action_in[0:29]"
+                    ),
+                    "deploy_csv_note": (
+                        "prefill entries are indices 0..8 in state/action split "
+                        "logs; first live CONTROL entry is index 9"
+                    ),
+                }
+                if getattr(args, "source_history_prefill", False)
+                else None
+            ),
+            "source_state_alignment": (
+                {
+                    **report["source_state_alignment"],
+                    "payload_file": str(
+                        Path(args.source_state_alignment_file).resolve()
+                    ),
+                    "payload_file_sha256": _sha256(
+                        Path(args.source_state_alignment_file).resolve()
+                    ),
+                    "initial_state_file": str(
+                        Path(args.source_history_initial_state_file).resolve()
+                    ),
+                    "initial_state_file_sha256": _sha256(
+                        Path(args.source_history_initial_state_file).resolve()
+                    ),
+                    "simulator_clock_note": (
+                        "sim qpos/qvel follows the phase-matched physical source "
+                        "timeline; copied policy/reference columns in replay data.csv "
+                        "are provenance only, while publisher starts at policy_offset"
+                    ),
+                }
+                if _uses_source_state_alignment(args)
+                else None
+            ),
             "orientation_base_sample": args.base_sample,
             "first_control_tick_heading": "cpp_initial_alignment",
             "heading_correction_enabled": args.heading_correction,
@@ -1207,12 +1595,23 @@ def _write_manifest(
             "root_assist": args.root_assist,
         },
         "models": {
+            "deploy_binary": str(_selected_deploy_binary(args).resolve()),
+            "deploy_binary_sha256": _sha256(
+                _selected_deploy_binary(args).resolve()
+            ),
             "encoder": str(model.encoder),
             "encoder_sha256": _sha256(model.encoder),
             "decoder": str(model.decoder),
             "decoder_sha256": _sha256(model.decoder),
             "obs_config": str(model.obs_config),
             "obs_config_sha256": _sha256(model.obs_config),
+        },
+        "logging": {
+            "simulator_replay_csv": bool(args.save_csv),
+            "deploy_csv": bool(args.deploy_csv_logs),
+            "deploy_prefill_rows": (
+                9 if getattr(args, "source_history_prefill", False) else 0
+            ),
         },
         "commands": {name: list(command) for name, command in commands.items()},
         "preflight": report,
@@ -1557,7 +1956,18 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--checkpoint",
         default="low_latency",
-        choices=("regular", "sonic_release", "low_latency", "low", "low-latency"),
+        choices=(
+            "regular",
+            "sonic_release",
+            "low_latency",
+            "low",
+            "low-latency",
+            "sonic_v1_1",
+            "sonic-v1-1",
+            "sonic-v1.1",
+            "v1.1",
+            "v1_1",
+        ),
         help="Checkpoint family (default: low_latency)",
     )
     parser.add_argument(
@@ -1592,6 +2002,15 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
 def _add_launch_arguments(parser: argparse.ArgumentParser) -> None:
     bool_action = argparse.BooleanOptionalAction
     parser.add_argument("--save-csv", action=bool_action, default=True)
+    parser.add_argument(
+        "--deploy-csv-logs",
+        action=bool_action,
+        default=True,
+        help=(
+            "save deploy token/action/reference CSV logs (default: on); disable only "
+            "for timing-isolation runs while keeping the simulator replay CSV"
+        ),
+    )
     parser.add_argument("--viewer", action=bool_action, default=True)
     parser.add_argument("--stop-at-source-end", action=bool_action, default=True)
     parser.add_argument("--asset-model-root")
@@ -1644,10 +2063,34 @@ def _add_launch_arguments(parser: argparse.ArgumentParser) -> None:
         default="previous-index5",
         help="CSV pelvis sample used to recover absolute reference orientation",
     )
-    # Offset 0 is policy_seq 31115, but that group contains only the final two
-    # logger rows of an already-running policy tick.  Offset 1 is the first
-    # complete boundary (31116), matching run_task_sim_loop's default init.
-    parser.add_argument("--start-policy-offset", type=int, default=1)
+    parser.add_argument(
+        "--start-policy-offset",
+        type=int,
+        default=DEFAULT_START_POLICY_OFFSET,
+        help=(
+            "zero-based offset whose origin is always the second raw "
+            "policy_seq group; default 10 selects the 12th raw group"
+        ),
+    )
+    parser.add_argument(
+        "--source-history-prefill",
+        action=bool_action,
+        default=True,
+        help=(
+            "prefill the decoder with the previous nine complete 50 Hz states "
+            "from data.csv (default: enabled); use "
+            "--no-source-history-prefill for a zero-history diagnostic"
+        ),
+    )
+    parser.add_argument(
+        "--source-state-init",
+        action="store_true",
+        help=(
+            "initialize MuJoCo at the same phase-matched source state used by "
+            "source-history prefill, but keep the official deploy's zero history; "
+            "intended as a strict diagnostic control"
+        ),
+    )
     parser.add_argument("--chunk-size", type=int, default=50)
     parser.add_argument("--lookahead", type=int, default=50)
     parser.add_argument("--deploy-ready-timeout", type=float, default=180.0)
@@ -1708,6 +2151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "run" and not args.dry_run and not args.skip_process_check:
             _check_runtime_conflicts()
         run_dir = _new_run_dir(args, model.name)
+        _prepare_source_history_file(args, run_dir)
         if args.command == "deploy":
             commands = {"deploy": deploy_command(args, model, run_dir / "deploy_csv")}
             _write_manifest(run_dir, args, model, report, commands)

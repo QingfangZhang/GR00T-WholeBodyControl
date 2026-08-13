@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import queue
 import sys
@@ -1066,6 +1067,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="mujoco/model directory containing g1/meshes and task_assets",
     )
     parser.add_argument("--save-csv", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--initial-state-json",
+        type=Path,
+        help=(
+            "optional JSON containing qpos/qvel for the paused initial state; "
+            "used by source-history diagnostics"
+        ),
+    )
     parser.add_argument("--viewer", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--wait-for-lowcmd", action=argparse.BooleanOptionalAction, default=True
@@ -1124,6 +1133,20 @@ def main() -> int:
         row_index=args.row_index,
         policy_offset=args.policy_offset,
     )
+    if args.initial_state_json is not None:
+        initial_state_path = args.initial_state_json.expanduser().resolve()
+        try:
+            initial_state_payload = json.loads(
+                initial_state_path.read_text(encoding="utf-8")
+            )
+            qpos_override = initial_state_payload["qpos"]
+            qvel_override = initial_state_payload["qvel"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ValueError(
+                f"cannot load initial state override {initial_state_path}: {exc}"
+            ) from exc
+        timeline.override_initial_state(qpos_override, qvel_override)
+        print(f"[task-sim] initial state override: {initial_state_path}")
     run_dir: Path | None = None
     if not args.dry_run and args.run_dir is not None:
         # Unified runs always retain metadata/log-sidecars in their assigned

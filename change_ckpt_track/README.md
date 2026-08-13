@@ -44,6 +44,8 @@ checkpoint”的正式实验，也不能只凭一个 RMSE 数值认定语义任�
 
 - 以连续的 `policy_seq` 分组，每组取第一行，得到约 50 Hz 的策略帧；
 - 若首尾 `policy_seq` 的行数不到典型组的一半，视为录制截断并丢弃；
+- launcher 编号不依赖上述截边结果：原 CSV 的第二个 raw `policy_seq` group
+  永远是公开 offset 0；默认 offset 10 对应原 CSV 第 12 个 group；
 - 从 MuJoCo qpos/qvel 中按关节名提取 29 个身体关节，排除 14 个手指关节和
   任务物体自由度；
 - 29 维身体状态转换为 G1 IsaacLab 顺序后发给 deploy；
@@ -133,6 +135,8 @@ SONIC deploy 或 publisher 占用 DDS/ZMQ：
 ```bash
 source .venv_sim/bin/activate
 
+.venv_sim/bin/python change_ckpt_track/build_source_history_deploy.py
+
 python change_ckpt_track/launch_checkpoint_rollout.py preflight \
   --checkpoint regular \
   --recording sample_data/ztj/20260612/20260612_144117_g1_sim
@@ -178,6 +182,11 @@ cache；ONNX 原文件不会被移动或修改。
 一次只运行一套。launcher 会统一启动任务 simulator、C++ deploy 和 qpos
 reference publisher；默认打开 MuJoCo viewer、自动完成 INIT/CONTROL/reference
 播放，到 reference 结束后停止，并默认保存 CSV。
+
+source-history prefill 默认启用，默认 `--start-policy-offset 10`。这里 offset 0
+固定表示原 CSV 的第二个 raw `policy_seq` group，无论第一个 group 完整还是被
+qpos-reference 截边丢弃；launcher 会按真实 `policy_seq` 反查截边后的内部下标，
+保证 simulator、publisher 和 history 使用同一个时刻。
 
 regular：
 
@@ -239,6 +248,57 @@ change_ckpt_track/data/20260612_144117_g1_sim_sonic_v1_1/
 ```
 
 同一 recording 和 checkpoint 重复运行会覆盖对应的同名目录，不使用时间戳。
+
+### 默认：用原 CSV 预填 decoder 的启动历史
+
+默认会从接管点之前九个 50 Hz source 状态预填 decoder history，并对齐第一条
+live MuJoCo 状态。普通运行无需再传 `--source-history-prefill`；第一次运行或
+部署源码改变后先构建 wrapper：
+
+```bash
+.venv_sim/bin/python change_ckpt_track/build_source_history_deploy.py
+
+.venv_sim/bin/python change_ckpt_track/launch_checkpoint_rollout.py run \
+  --checkpoint regular \
+  --recording sample_data/ztj/20260612/20260612_144154_g1_sim \
+  --start-policy-offset 10 \
+  --root-assist none \
+  --no-viewer
+```
+
+公开 `--start-policy-offset 0` 永远指原 CSV 的第二个 raw group；因此 `10`
+对应 raw offset 11（第 12 个 group）。首组是否完整只会改变 qpos-reference 的
+内部 processed index，不会改变公开编号。公开 offset、raw offset、processed
+offset 和真实 `policy_seq` 都写入 manifest；三条链路不一致时 launcher 会拒绝
+运行。
+
+这个模式会：
+
+- 用原 CSV 中前九个 policy 帧的实测 pelvis orientation、角速度、29 维关节
+  位置/速度和对应 last action 预填 decoder；
+- 第十个（当前）状态仍来自第一条 live MuJoCo DDS 状态；它的 last action 从
+  原 CSV 恢复；
+- 让 MuJoCo 从与 `policy_received_dof_pos` 严格相位匹配的源行开始，且启动时
+  校验 quaternion、角速度、q 和 dq，超限便中止；
+- 仍然使用 qpos 构造的 50 Hz reference、canonical regular lag 和正常闭环
+  动力学；不会启用 root assist。
+
+它使用 `change_ckpt_track/bin/g1_deploy_onnx_ref_source_history`，不会改动或替换
+官方 deploy binary。要专门运行原来的零填充诊断，可显式添加
+`--no-source-history-prefill`。结果目录不再注明 offset 或 prefill，例如：
+
+```text
+change_ckpt_track/data/20260612_144154_g1_sim_regular/
+```
+
+同一 recording/checkpoint/future-window/root-assist 下，不同 offset 或 history
+模式会覆盖同名目录；准确配置以 `launch_manifest.json` 为准。默认 prefill 后，
+新 controller 前十次推理的 history 仍逐帧含有旧 controller 的部分，从第十一
+次推理开始十帧 action/state history 才全部来自新 controller。
+
+目录中会额外保存 `source_history_prefill.json` 和
+`source_history_initial_state.json`；`deploy.log` 应出现 “loaded 9 source
+entries” 以及首条 live state 的四类对齐误差。
 
 ### 可选：运行时补偿原 recording 的 root
 
@@ -592,6 +652,8 @@ MuJoCo qpos。
   change_ckpt_track/test_recorded_slot_lags.py \
   change_ckpt_track/test_launch_checkpoint_rollout.py \
   change_ckpt_track/test_run_task_sim_loop.py \
+  change_ckpt_track/test_source_history_prefill.py \
+  change_ckpt_track/test_source_history_prefill_core.py \
   change_ckpt_track/test_compare_qpos_track.py
 ```
 

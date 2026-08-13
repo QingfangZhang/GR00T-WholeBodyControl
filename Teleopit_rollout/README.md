@@ -1,9 +1,11 @@
 # Teleopit controller-replacement rollout
 
-This directory runs the pinned Teleopit `track_g1` controller on the same
-recorded MuJoCo task scenes and the same robot-qpos references used by the
-SONIC qpos-track experiment.  It does not modify `gear_sonic`,
-`gear_sonic_deploy`, `change_ckpt`, or `change_ckpt_track`.
+This directory runs the pinned Teleopit `track_g1` controller on recorded
+MuJoCo task scenes.  The default reference remains the recorded robot qpos.
+An optional `sonic_reference_hybrid` mode instead uses the SONIC
+`reference_motion` pose while retaining the recording's root translation.
+It does not modify `gear_sonic`, `gear_sonic_deploy`, `change_ckpt`, or
+`change_ckpt_track`.
 
 ## What is being compared
 
@@ -24,6 +26,32 @@ The 29 joints are reordered by name into Teleopit's canonical order.  The
 recorded qvel is retained only as a diagnostic; Teleopit reference joint and
 torso velocities are recomputed from adjacent 50 Hz reference poses, as in
 Teleopit v0.5.0.
+
+### Optional SONIC reference-motion pose
+
+Select `--reference-source sonic_reference_hybrid` to construct each 50 Hz
+Teleopit target as:
+
+```text
+recorded actual root xyz
++ recovered pelvis world quaternion (relative target x recorded actual)
++ SONIC reference_motion slot-0 29-DoF joint pose
+```
+
+This is deliberately called a *hybrid*: the CSV's 640-D SONIC
+`reference_motion` contains joint pose/velocity and only the reference pelvis
+orientation *relative to the recorded robot*, but no reference root xyz.  Its
+world quaternion is recovered by multiplying that relative orientation by the
+recorded actual pelvis quaternion selected with the SONIC adapter's
+`previous-index5` convention.  Teleopit's target anchor is `torso_link`, rather
+than SONIC's pelvis anchor, so the resulting 36-D pose is passed through
+Teleopit's G1 forward kinematics.  Target joint, torso-linear, and
+torso-angular velocities are then recomputed between adjacent 50 Hz poses.
+
+Only SONIC slot 0 supplies the current pose.  SONIC slots 1--9 are future
+targets and are **not** Teleopit's history.  Teleopit's ten-frame input remains
+the online current observation plus its previous nine observations.  Hands
+still use the same-time CSV `left_hand_q` and `right_hand_q` targets.
 
 Although `qpos36` stores root xyz, the 167-D tracker observation does not carry
 an absolute reference x/y target.  Root translation contributes through the
@@ -96,8 +124,11 @@ the user's replay inspection, so the primary contact comparison is common
 `xyz`; `none` and `xy` remain ablations.  Whether a foot actually steps onto
 the bin and remains stable must be judged from replay/contact metrics.
 Pedal/lid qpos alone is not a valid binary label.
-Do not compare Teleopit qpos-track directly with `change_ckpt`: that pipeline
-uses a different reference construction.
+Do not compare the default Teleopit qpos-track directly with `change_ckpt`:
+that pipeline uses a different reference construction.  The optional hybrid
+mode is the closer comparison because its body pose comes from the same SONIC
+`reference_motion`, but it still supplements missing root xyz from actual qpos
+and feeds a different tracker observation/history.
 
 ## One-time setup
 
@@ -142,6 +173,16 @@ Teleopit_rollout/.venv/bin/python \
   --policy-count 3 --root-assist xy --validate-only
 ```
 
+Validate the SONIC-reference hybrid path by adding:
+
+```bash
+Teleopit_rollout/.venv/bin/python \
+  Teleopit_rollout/launch_teleopit_rollout.py \
+  sample_data/ztj/20260612/20260612_144127_g1_sim \
+  --reference-source sonic_reference_hybrid \
+  --policy-count 3 --root-assist xy --validate-only
+```
+
 Short, writable smoke test:
 
 ```bash
@@ -176,6 +217,19 @@ Teleopit_rollout/.venv/bin/python \
   --root-assist xy --overwrite
 ```
 
+Run the same scene with the SONIC-reference hybrid target:
+
+```bash
+Teleopit_rollout/.venv/bin/python \
+  Teleopit_rollout/launch_teleopit_rollout.py \
+  sample_data/ztj/20260612/20260720_144342_g1_sim \
+  --reference-source sonic_reference_hybrid \
+  --root-assist xy --overwrite
+```
+
+Its automatic output name is
+`20260720_144342_g1_sim_teleopit_sonic_reference_hybrid_root_assist_xy`.
+
 For a custom checkpoint/XML, a sliced run, or changed rollout duration, the
 launcher requires an explicit `--run-name`; this prevents a smoke test from
 overwriting a formal result with the same recording basename.
@@ -201,9 +255,12 @@ launch_manifest.json     checkpoint/XML hashes, command and environment
 run_complete.json        completion marker plus output artifact SHA-256 hashes
 ```
 
-The wide CSV keeps the source schema for compatibility.  Its old
-`reference_motion` columns are provenance, not Teleopit input; exact Teleopit
-inputs and outputs are in `teleopit_policy.npz`.
+The wide CSV keeps the source schema for compatibility.  In default qpos mode,
+its old `reference_motion` columns are provenance only.  In hybrid mode they
+are parsed to build the target pose, but Teleopit still receives the resulting
+167-D observation rather than the raw 640 values.  Exact constructed reference,
+Teleopit inputs, and outputs are in `prepared_reference.npz` and
+`teleopit_policy.npz`.
 
 Replay with the original same-time qpos as the default cyan/amber ghost:
 
@@ -225,7 +282,11 @@ recorded body qpos, and amber is recorded hand qpos.  `--root-mode actual`
 attaches the ghost root to the rollout root when the goal is to inspect only
 articulation error.
 
-## Results generated in this workspace
+## Original qpos-track results generated in this workspace
+
+The newer SONIC-reference hybrid implementation, seven completed runs, and
+qpos-track comparison are documented in
+[`SONIC_REFERENCE_HYBRID_RESULTS.md`](SONIC_REFERENCE_HYBRID_RESULTS.md).
 
 Five formal directories have been generated with a one-second final hold:
 
@@ -274,12 +335,13 @@ A publication-quality paired comparison should match physics/control/assist
 clocks, log at 400 Hz or resample both outputs to common timestamps, and report
 the runtime/input-horizon differences explicitly.
 
-Run the regression tests with:
+Run all regression tests with:
 
 ```bash
-Teleopit_rollout/.venv/bin/python -m unittest \
-  Teleopit_rollout.test_adapter -v
+Teleopit_rollout/.venv/bin/python -m unittest discover \
+  -s Teleopit_rollout -p 'test_*.py' -v
 ```
 
-The tests lock the two recording boundaries, name-based joint mapping, first
-167-D observation, ONNX action transform, and ten-frame history behavior.
+The tests lock recording boundaries, name-based joint mapping, first 167-D
+observation, ONNX action transform, ten-frame history behavior, hybrid
+component mapping, policy-sequence alignment, and provenance metadata.

@@ -59,7 +59,9 @@ except ModuleNotFoundError:
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RECORDING = REPO_ROOT / "sample_data/ztj/20260720_144342_g1_sim"
+DEFAULT_RECORDING = (
+    REPO_ROOT / "sample_data/ztj/20260612/20260720_144342_g1_sim"
+)
 DEFAULT_CHECKPOINT = REPO_ROOT / "sonic_release/last.pt"
 TOKEN_DIMENSION = 64
 FSQ_LEVELS = 32

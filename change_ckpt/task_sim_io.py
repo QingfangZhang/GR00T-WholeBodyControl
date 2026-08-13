@@ -281,6 +281,28 @@ class CsvTimeline:
     def state(self) -> tuple[np.ndarray, np.ndarray]:
         return self._qpos_states[self._position].copy(), self._qvel_states[self._position].copy()
 
+    def override_initial_state(
+        self, qpos: Sequence[float], qvel: Sequence[float]
+    ) -> None:
+        """Replace only the first state while preserving the source timeline."""
+
+        qpos_array = np.asarray(qpos, dtype=np.float64)
+        qvel_array = np.asarray(qvel, dtype=np.float64)
+        if qpos_array.shape != self._qpos_states[0].shape:
+            raise ValueError(
+                f"initial qpos override shape {qpos_array.shape}; expected "
+                f"{self._qpos_states[0].shape}"
+            )
+        if qvel_array.shape != self._qvel_states[0].shape:
+            raise ValueError(
+                f"initial qvel override shape {qvel_array.shape}; expected "
+                f"{self._qvel_states[0].shape}"
+            )
+        if not np.isfinite(qpos_array).all() or not np.isfinite(qvel_array).all():
+            raise ValueError("initial state override contains non-finite values")
+        self._qpos_states[0] = qpos_array
+        self._qvel_states[0] = qvel_array
+
     def advance(self) -> bool:
         """Advance one recorded 400 Hz row, returning false at end-of-file."""
         if self._position + 1 >= len(self._qpos_states):

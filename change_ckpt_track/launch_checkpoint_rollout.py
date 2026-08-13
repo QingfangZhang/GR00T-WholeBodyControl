@@ -56,6 +56,23 @@ from datetime import datetime
 from functools import lru_cache
 from typing import Any, Iterable, Sequence
 
+import numpy as np
+
+try:
+    from .source_history_prefill import (
+        SourceHistoryError,
+        build_source_history_prefill,
+        summary as source_history_summary,
+        write_source_history_prefill,
+    )
+except ImportError:  # Direct ``python change_ckpt_track/launch_...py`` execution.
+    from source_history_prefill import (  # type: ignore[no-redef]
+        SourceHistoryError,
+        build_source_history_prefill,
+        summary as source_history_summary,
+        write_source_history_prefill,
+    )
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CHANGE_ROOT = REPO_ROOT / "change_ckpt_track"
@@ -66,6 +83,35 @@ DEFAULT_RECORDING = (
 DEFAULT_DATA_ROOT = CHANGE_ROOT / "data"
 DEPLOY_ROOT = REPO_ROOT / "gear_sonic_deploy"
 DEPLOY_BINARY = DEPLOY_ROOT / "target/release/g1_deploy_onnx_ref"
+SOURCE_HISTORY_DEPLOY_BINARY = (
+    CHANGE_ROOT / "bin/g1_deploy_onnx_ref_source_history"
+)
+SOURCE_HISTORY_BUILD_MANIFEST = (
+    CHANGE_ROOT / "build/source_history_deploy/build_manifest.json"
+)
+SOURCE_HISTORY_TRACKED_BUILD_INPUTS = {
+    "wrapper_source": (
+        CHANGE_ROOT
+        / "source_history_deploy/g1_deploy_onnx_ref_source_history.cpp"
+    ),
+    "official_source": (
+        DEPLOY_ROOT
+        / "src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp"
+    ),
+    "state_logger_header": (
+        DEPLOY_ROOT / "src/g1/g1_deploy_onnx_ref/include/state_logger.hpp"
+    ),
+    "policy_parameters_header": (
+        DEPLOY_ROOT
+        / "src/g1/g1_deploy_onnx_ref/include/policy_parameters.hpp"
+    ),
+    "compile_database": DEPLOY_ROOT / "build/compile_commands.json",
+    "link_file": (
+        DEPLOY_ROOT
+        / "build/src/g1/g1_deploy_onnx_ref/"
+        "CMakeFiles/g1_deploy_onnx_ref.dir/link.txt"
+    ),
+}
 SIM_SCRIPT = CHANGE_ROOT / "run_task_sim_loop.py"
 PUBLISHER_SCRIPT = CHANGE_ROOT / "csv_reference_publisher.py"
 SIM_PYTHON = REPO_ROOT / ".venv_sim/bin/python"
@@ -73,6 +119,13 @@ REFERENCE_FALLBACK = DEPLOY_ROOT / "reference/example"
 PLANNER_MODEL = (
     CHECKPOINT_SOURCE_ROOT / "models/planner/target_vel/V2/planner_sonic.onnx"
 )
+
+# Both rollout launchers expose the same stable offset convention: the first
+# raw policy_seq group is ignored for numbering, regardless of whether it is a
+# complete group.  Public offset 0 is therefore raw group 1 (the second group),
+# and the default offset 10 selects raw group 11.
+POLICY_OFFSET_RAW_BASE = 1
+DEFAULT_START_POLICY_OFFSET = 10
 
 # Dimensions are the current C++ observation-registry dimensions.  Keeping the
 # table here makes preflight catch stale YAML aliases before TensorRT is started.
@@ -84,6 +137,7 @@ OBSERVATION_DIMS: dict[str, int] = {
     "his_last_actions_10frame_step1": 290,
     "his_gravity_dir_10frame_step1": 30,
 }
+SOURCE_HISTORY_POLICY_OBSERVATIONS = tuple(OBSERVATION_DIMS)
 
 ENCODER_OBSERVATION_DIMS: dict[str, int] = {
     "encoder_mode": 3,
@@ -291,6 +345,40 @@ def _processed_reference(args: argparse.Namespace) -> Any:
     )
 
 
+@lru_cache(maxsize=16)
+def _raw_policy_seq_groups(csv_path_value: str) -> tuple[int, ...]:
+    """Return consecutive raw CSV policy groups without completeness filtering."""
+
+    csv_path = Path(csv_path_value)
+    unique_policy_seq: list[int] = []
+    try:
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            if reader.fieldnames is None or "policy_seq" not in reader.fieldnames:
+                raise PreflightError(
+                    f"Recording CSV has no policy_seq column: {csv_path}"
+                )
+            for row_index, row in enumerate(reader):
+                try:
+                    value = int(float(row["policy_seq"]))
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise PreflightError(
+                        f"Invalid policy_seq at CSV data row {row_index}: "
+                        f"{row.get('policy_seq')!r}"
+                    ) from exc
+                if not unique_policy_seq or value != unique_policy_seq[-1]:
+                    unique_policy_seq.append(value)
+    except OSError as exc:
+        raise PreflightError(f"Cannot read recording CSV {csv_path}: {exc}") from exc
+    return tuple(unique_policy_seq)
+
+
+def _requested_raw_policy_offset(args: argparse.Namespace) -> int:
+    """Translate the public second-group-based offset to a raw group index."""
+
+    return int(args.start_policy_offset) + POLICY_OFFSET_RAW_BASE
+
+
 def _recorded_slot_lag_report(args: argparse.Namespace) -> dict[str, Any]:
     try:
         from change_ckpt_track.recorded_slot_lags import (
@@ -316,14 +404,48 @@ def _recorded_slot_lag_report(args: argparse.Namespace) -> dict[str, Any]:
 
 def _selected_reference_frame(args: argparse.Namespace) -> tuple[Any, int]:
     sequence = _processed_reference(args)
-    offset = int(args.start_policy_offset)
-    count = int(len(sequence.policy_seq))
-    if offset < 0 or offset >= count:
+    user_offset = int(args.start_policy_offset)
+    raw_offset = _requested_raw_policy_offset(args)
+    raw_policy_seq = _raw_policy_seq_groups(
+        str(_recording_csv(Path(args.recording)).resolve())
+    )
+    if user_offset < 0 or raw_offset >= len(raw_policy_seq):
         raise PreflightError(
-            f"--start-policy-offset={offset} is outside the processed qpos "
-            f"sequence [0, {count - 1}]"
+            f"--start-policy-offset={user_offset} maps to raw group {raw_offset}, "
+            f"outside the available second-group-based range "
+            f"[0, {max(len(raw_policy_seq) - POLICY_OFFSET_RAW_BASE - 1, -1)}]"
         )
-    return sequence, offset
+    selected_policy_seq = raw_policy_seq[raw_offset]
+    matches = np.flatnonzero(
+        np.asarray(sequence.policy_seq, dtype=np.int64) == selected_policy_seq
+    )
+    if len(matches) != 1:
+        raise PreflightError(
+            "Requested raw policy group is not present exactly once in the "
+            "processed qpos reference: "
+            f"public offset={user_offset}, raw offset={raw_offset}, "
+            f"policy_seq={selected_policy_seq}, processed matches="
+            f"{matches.astype(int).tolist()}. This usually means the selected "
+            "group was removed by edge trimming."
+        )
+    return sequence, int(matches[0])
+
+
+def _raw_policy_offset_for_selected_frame(args: argparse.Namespace) -> int:
+    """Map the processed qpos-reference offset back to the raw CSV group index."""
+
+    sequence, offset = _selected_reference_frame(args)
+    selected_policy_seq = int(sequence.policy_seq[offset])
+    raw_offset = _requested_raw_policy_offset(args)
+    raw_policy_seq = _raw_policy_seq_groups(
+        str(_recording_csv(Path(args.recording)).resolve())
+    )
+    if raw_offset >= len(raw_policy_seq) or raw_policy_seq[raw_offset] != selected_policy_seq:
+        raise PreflightError(
+            "Processed qpos reference does not map back to the requested raw CSV "
+            f"group: policy_seq={selected_policy_seq}, raw offset={raw_offset}"
+        )
+    return raw_offset
 
 
 def _regular_export_help() -> str:
@@ -688,11 +810,83 @@ def _validate_recording(recording: Path) -> dict[str, Any]:
     }
 
 
-def _check_deploy_binary() -> dict[str, Any]:
-    if not DEPLOY_BINARY.is_file() or not os.access(DEPLOY_BINARY, os.X_OK):
+def _selected_deploy_binary(args: argparse.Namespace) -> Path:
+    if getattr(args, "source_history_prefill", False):
+        return SOURCE_HISTORY_DEPLOY_BINARY
+    return DEPLOY_BINARY
+
+
+def _validate_source_history_build(deploy_binary: Path) -> dict[str, Any]:
+    rebuild_hint = (
+        ".venv_sim/bin/python "
+        "change_ckpt_track/build_source_history_deploy.py"
+    )
+    if not SOURCE_HISTORY_BUILD_MANIFEST.is_file():
         raise PreflightError(
-            f"Deploy executable is missing: {DEPLOY_BINARY}\n"
-            "Build it from gear_sonic_deploy before running this experiment."
+            "Source-history deploy build manifest is missing; rebuild it with:\n"
+            f"  {rebuild_hint}"
+        )
+    try:
+        payload = json.loads(
+            SOURCE_HISTORY_BUILD_MANIFEST.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PreflightError(
+            "Cannot read the source-history deploy build manifest; rebuild it with:\n"
+            f"  {rebuild_hint}\n({exc})"
+        ) from exc
+
+    mismatches: list[str] = []
+    if Path(str(payload.get("output", ""))).resolve() != deploy_binary.resolve():
+        mismatches.append("output path")
+    elif payload.get("output_sha256") != _sha256(deploy_binary):
+        mismatches.append("output binary hash")
+
+    if payload.get("official_binary_sha256") != _sha256(DEPLOY_BINARY.resolve()):
+        mismatches.append("official deploy binary hash")
+
+    recorded_inputs = payload.get("tracked_build_inputs")
+    if not isinstance(recorded_inputs, dict):
+        mismatches.append("tracked build-input metadata")
+    else:
+        for name, expected_path in SOURCE_HISTORY_TRACKED_BUILD_INPUTS.items():
+            expected_path = expected_path.resolve()
+            item = recorded_inputs.get(name)
+            if not isinstance(item, dict):
+                mismatches.append(f"{name} metadata")
+                continue
+            if Path(str(item.get("path", ""))).resolve() != expected_path:
+                mismatches.append(f"{name} path")
+                continue
+            if not expected_path.is_file() or item.get("sha256") != _sha256(
+                expected_path
+            ):
+                mismatches.append(f"{name} hash")
+
+    if mismatches:
+        raise PreflightError(
+            "Source-history deploy is stale or does not match this checkout "
+            f"({', '.join(mismatches)}). Rebuild it with:\n  {rebuild_hint}"
+        )
+    return {
+        "manifest": str(SOURCE_HISTORY_BUILD_MANIFEST.resolve()),
+        "manifest_sha256": _sha256(SOURCE_HISTORY_BUILD_MANIFEST),
+        "tracked_inputs": sorted(SOURCE_HISTORY_TRACKED_BUILD_INPUTS),
+        "status": "current",
+    }
+
+
+def _check_deploy_binary(args: argparse.Namespace) -> dict[str, Any]:
+    deploy_binary = _selected_deploy_binary(args)
+    if not deploy_binary.is_file() or not os.access(deploy_binary, os.X_OK):
+        build_hint = (
+            "Run: .venv_sim/bin/python "
+            "change_ckpt_track/build_source_history_deploy.py"
+            if getattr(args, "source_history_prefill", False)
+            else "Build it from gear_sonic_deploy before running this experiment."
+        )
+        raise PreflightError(
+            f"Deploy executable is missing: {deploy_binary}\n{build_hint}"
         )
     if not PLANNER_MODEL.is_file():
         raise PreflightError(
@@ -700,7 +894,7 @@ def _check_deploy_binary() -> dict[str, Any]:
             f"mode, but it is missing: {PLANNER_MODEL}"
         )
     completed = subprocess.run(
-        ["ldd", str(DEPLOY_BINARY)],
+        ["ldd", str(deploy_binary)],
         cwd=REPO_ROOT,
         text=True,
         stdout=subprocess.PIPE,
@@ -713,11 +907,18 @@ def _check_deploy_binary() -> dict[str, Any]:
         raise PreflightError(
             f"Deploy executable has unresolved shared libraries:\n  " + "\n  ".join(missing or [completed.stdout.strip()])
         )
-    return {
-        "deploy_binary": str(DEPLOY_BINARY),
+    result = {
+        "deploy_binary": str(deploy_binary),
+        "deploy_binary_sha256": _sha256(deploy_binary),
+        "source_history_variant": deploy_binary == SOURCE_HISTORY_DEPLOY_BINARY,
         "planner_model": str(PLANNER_MODEL),
         "shared_libraries": "resolved",
     }
+    if deploy_binary == SOURCE_HISTORY_DEPLOY_BINARY:
+        result["source_history_build"] = _validate_source_history_build(
+            deploy_binary
+        )
+    return result
 
 
 def _check_port_available(port: int) -> None:
@@ -748,6 +949,7 @@ def _runtime_conflicts() -> list[dict[str, Any]]:
     """Find old simulator/deploy processes that would share DDS or ZMQ state."""
     watched = {
         "g1_deploy_onnx_ref",
+        "g1_deploy_onnx_ref_source_history",
         "run_sim_loop.py",
         "run_task_sim_loop.py",
         "csv_reference_publisher.py",
@@ -826,7 +1028,7 @@ def _probe_recording_adapters(args: argparse.Namespace, model: ModelFiles) -> No
         "--rate",
         str(args.reference_rate),
         "--start-policy-offset",
-        str(args.start_policy_offset),
+        str(offset),
         "--chunk-size",
         str(args.chunk_size),
         "--lookahead",
@@ -895,6 +1097,7 @@ def run_preflight(args: argparse.Namespace, *, include_adapters: bool = True) ->
             "--save-csv",
             "--viewer",
             "--root-assist",
+            "--initial-state-json",
         ),
     )
     _probe_help(
@@ -910,7 +1113,52 @@ def run_preflight(args: argparse.Namespace, *, include_adapters: bool = True) ->
             "--lookahead",
         ),
     )
-    report["deploy"] = _check_deploy_binary()
+    report["deploy"] = _check_deploy_binary(args)
+    if getattr(args, "source_history_prefill", False):
+        policy_observations = tuple(report["model"]["policy_observations"])
+        if policy_observations != SOURCE_HISTORY_POLICY_OBSERVATIONS:
+            raise PreflightError(
+                "Source-history prefill supports exactly the current SONIC "
+                "token + base-angular-velocity/body-q/body-dq/last-action/"
+                "gravity decoder layout; got: "
+                + ", ".join(policy_observations)
+            )
+
+        sequence, processed_offset = _selected_reference_frame(args)
+        actual_policy_seq = int(sequence.policy_seq[processed_offset])
+        raw_policy_offset = _raw_policy_offset_for_selected_frame(args)
+        try:
+            prefill = build_source_history_prefill(
+                recording,
+                start_policy_seq=actual_policy_seq,
+            )
+        except SourceHistoryError as exc:
+            raise PreflightError(
+                f"Source-history reconstruction is invalid: {exc}"
+            ) from exc
+        payload_policy_seq = int(prefill["current"]["policy_seq"])
+        payload_raw_offset = int(prefill["raw_start_policy_offset"])
+        if (
+            payload_policy_seq != actual_policy_seq
+            or payload_raw_offset != raw_policy_offset
+        ):
+            raise PreflightError(
+                "Source-history selection does not match the processed qpos "
+                "reference: "
+                f"processed offset={processed_offset}, "
+                f"expected policy_seq={actual_policy_seq}/raw offset={raw_policy_offset}, "
+                f"got policy_seq={payload_policy_seq}/raw offset={payload_raw_offset}"
+            )
+        args.source_history_raw_policy_offset = raw_policy_offset
+        args.source_history_prefill_payload = prefill
+        report["source_history_prefill"] = {
+            **source_history_summary(prefill),
+            "launcher_public_policy_offset": int(args.start_policy_offset),
+            "launcher_offset_origin_raw_group": POLICY_OFFSET_RAW_BASE,
+            "qpos_track_processed_sequence_offset": processed_offset,
+            "qpos_track_actual_policy_seq": actual_policy_seq,
+            "raw_policy_group_offset": raw_policy_offset,
+        }
     if hasattr(args, "control_dt"):
         _probe_recording_adapters(args, model)
         report["adapter_dry_run"] = {
@@ -964,6 +1212,7 @@ def deploy_command(args: argparse.Namespace, model: ModelFiles, logs_dir: Path) 
         "--zmq-host",
         "--zmq-port",
         "--zmq-topic",
+        "--source-history-prefill-file",
     )
     if any(item == option or item.startswith(option + "=") for item in args.deploy_arg for option in locked):
         raise PreflightError(
@@ -971,7 +1220,7 @@ def deploy_command(args: argparse.Namespace, model: ModelFiles, logs_dir: Path) 
             "those are locked to preserve local-encoder and stream-alignment semantics"
         )
     command = [
-        str(DEPLOY_BINARY),
+        str(_selected_deploy_binary(args)),
         _network_interface(),
         str(model.decoder),
         str(REFERENCE_FALLBACK),
@@ -1003,6 +1252,16 @@ def deploy_command(args: argparse.Namespace, model: ModelFiles, logs_dir: Path) 
         "--target-motion-logfile",
         str(logs_dir.parent / "target_motion.csv"),
     ]
+    if getattr(args, "source_history_prefill", False):
+        prefill_file = getattr(args, "source_history_prefill_file", None)
+        if prefill_file is None:
+            raise PreflightError(
+                "source-history prefill file was not prepared before building "
+                "the deploy command"
+            )
+        command.extend(
+            ["--source-history-prefill-file", str(Path(prefill_file).resolve())]
+        )
     command.extend(args.deploy_arg)
     return command
 
@@ -1024,6 +1283,7 @@ def simulator_command(args: argparse.Namespace, run_dir: Path) -> list[str]:
         "--control-dt",
         "--source-dt",
         "--root-assist",
+        "--initial-state-json",
         "--physics-dt",
         "--viewer-dt",
         "--fall-height",
@@ -1059,12 +1319,28 @@ def simulator_command(args: argparse.Namespace, run_dir: Path) -> list[str]:
         "--gate-status-file",
         str(run_dir / "control_gate.status"),
     ]
-    # The offset is defined inside the processed qpos sequence (after optional
-    # edge trimming).  Resolve it back to the recording's actual policy_seq so
-    # the 400 Hz simulator timeline and 50 Hz publisher start on the same row
-    # without applying the trim/offset twice.
-    sequence, offset = _selected_reference_frame(args)
-    command.extend(["--policy-seq", str(int(sequence.policy_seq[offset]))])
+    if getattr(args, "source_history_prefill", False):
+        initial_state_file = getattr(args, "source_history_initial_state_file", None)
+        sim_row_index = getattr(args, "source_history_sim_row_index", None)
+        if initial_state_file is None or sim_row_index is None:
+            raise PreflightError(
+                "source-history initial state was not prepared before building "
+                "the simulator command"
+            )
+        command.extend(
+            [
+                "--row-index",
+                str(sim_row_index),
+                "--initial-state-json",
+                str(Path(initial_state_file).resolve()),
+            ]
+        )
+    else:
+        # The offset is defined inside the processed qpos sequence (after optional
+        # edge trimming). Resolve it back to the recording's actual policy_seq so
+        # the 400 Hz simulator timeline and 50 Hz publisher start on the same row.
+        sequence, offset = _selected_reference_frame(args)
+        command.extend(["--policy-seq", str(int(sequence.policy_seq[offset]))])
     if args.asset_model_root:
         command.extend(["--asset-model-root", str(_absolute(Path(args.asset_model_root)))])
     command.extend(args.sim_arg)
@@ -1104,6 +1380,7 @@ def publisher_command(args: argparse.Namespace, run_dir: Path) -> list[str]:
         raise PreflightError(
             "--publisher-arg may not override source, layout, timing, gate, or output options"
         )
+    _, processed_offset = _selected_reference_frame(args)
     command = [
         str(SIM_PYTHON),
         str(PUBLISHER_SCRIPT),
@@ -1118,7 +1395,7 @@ def publisher_command(args: argparse.Namespace, run_dir: Path) -> list[str]:
         "--rate",
         str(args.reference_rate),
         "--start-policy-offset",
-        str(args.start_policy_offset),
+        str(processed_offset),
         "--chunk-size",
         str(args.chunk_size),
         "--lookahead",
@@ -1145,6 +1422,72 @@ def publisher_command(args: argparse.Namespace, run_dir: Path) -> list[str]:
         command.extend(["--apply-heading-correction", "--heading-correction-tick", "1"])
     command.extend(args.publisher_arg)
     return command
+
+
+def _prepare_source_history_file(
+    args: argparse.Namespace, run_dir: Path
+) -> dict[str, Any] | None:
+    if not getattr(args, "source_history_prefill", False):
+        return None
+    payload = getattr(args, "source_history_prefill_payload", None)
+    if payload is None:
+        sequence, offset = _selected_reference_frame(args)
+        actual_policy_seq = int(sequence.policy_seq[offset])
+        try:
+            payload = build_source_history_prefill(
+                args.recording,
+                start_policy_seq=actual_policy_seq,
+            )
+        except SourceHistoryError as exc:
+            raise PreflightError(
+                f"Source-history reconstruction is invalid: {exc}"
+            ) from exc
+
+    source_csv = Path(payload["source_csv"])
+    if _sha256(source_csv) != payload["source_csv_sha256"]:
+        raise PreflightError(
+            f"Source CSV changed after preflight; refusing mixed provenance: {source_csv}"
+        )
+
+    prefill_path = write_source_history_prefill(
+        payload, run_dir / "source_history_prefill.json"
+    )
+    args.source_history_prefill_file = prefill_path
+    initial_state_path = run_dir / "source_history_initial_state.json"
+    initial_state_path.write_text(
+        json.dumps(
+            {
+                "format": "g1_source_history_initial_state",
+                "version": 1,
+                "source_csv": payload["source_csv"],
+                "source_csv_sha256": payload["source_csv_sha256"],
+                "policy_seq": payload["current"]["policy_seq"],
+                "policy_boundary_row_index": payload["current"][
+                    "source_row_index"
+                ],
+                "matched_source_row_index": payload["current"][
+                    "matched_source_row_index"
+                ],
+                "matched_control_time_s": payload["current"][
+                    "matched_control_time_s"
+                ],
+                "qpos": payload["current"]["sim_initial_qpos"],
+                "qvel": payload["current"]["sim_initial_qvel"],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    args.source_history_initial_state_file = initial_state_path
+    args.source_history_sim_row_index = int(
+        payload["current"]["matched_source_row_index"]
+    )
+    args.source_history_raw_policy_offset = int(
+        payload["raw_start_policy_offset"]
+    )
+    return payload
 
 
 def _new_run_dir(args: argparse.Namespace, checkpoint: str) -> Path:
@@ -1312,7 +1655,10 @@ def _write_manifest(
                 "the selected checkpoint do not require root-z."
             ),
             "task_object_state": (
-                "initialized from the selected source row, then physics-driven"
+                "initialized from the phase-matched measured source row, then "
+                "physics-driven"
+                if getattr(args, "source_history_prefill", False)
+                else "initialized from the selected source row, then physics-driven"
             ),
             "hand_targets": (
                 "the same recorded external targets are sent to both runs; "
@@ -1320,6 +1666,13 @@ def _write_manifest(
             ),
         },
         "initialization": {
+            "policy_offset": int(args.start_policy_offset),
+            "launcher_public_policy_offset": int(args.start_policy_offset),
+            "policy_offset_semantics": (
+                "zero-based from the second raw policy_seq group"
+            ),
+            "launcher_offset_origin_raw_group": POLICY_OFFSET_RAW_BASE,
+            "raw_policy_group_offset": _raw_policy_offset_for_selected_frame(args),
             "processed_sequence_offset": offset,
             "actual_start_policy_seq": int(sequence.policy_seq[offset]),
             "actual_start_source_row_index": int(
@@ -1328,8 +1681,48 @@ def _write_manifest(
             "drop_truncated_edges": bool(args.drop_truncated_edges),
             "gate_file": str(run_dir / "control_gate.status"),
             "publisher_gate_file": str(run_dir / "publisher.status"),
-            "history_mode": "cpp_state_logger_zero_fill_until_10_control_frames_exist",
+            "history_mode": (
+                "source_csv_previous_9_plus_first_live_current"
+                if getattr(args, "source_history_prefill", False)
+                else "cpp_state_logger_zero_fill_until_10_control_frames_exist"
+            ),
             "warmup_exclusion_s": 0.2,
+            "decoder_zero_padding_duration_s": (
+                0.0 if getattr(args, "source_history_prefill", False) else 0.2
+            ),
+            "warmup_note": (
+                "The 0.2 s generic startup window is retained for steady-state "
+                "comparisons. Source-history prefill removes decoder zero padding, "
+                "but not first-tick encoder/publisher transients."
+            ),
+            "source_history_prefill": (
+                {
+                    **report["source_history_prefill"],
+                    "file": str(Path(args.source_history_prefill_file).resolve()),
+                    "file_sha256": _sha256(
+                        Path(args.source_history_prefill_file).resolve()
+                    ),
+                    "initial_state_file": str(
+                        Path(args.source_history_initial_state_file).resolve()
+                    ),
+                    "initial_state_file_sha256": _sha256(
+                        Path(args.source_history_initial_state_file).resolve()
+                    ),
+                    "first_live_last_action": (
+                        "source current policy_last_action_in[0:29]"
+                    ),
+                    "deploy_csv_note": (
+                        "prefill entries are indices 0..8 in state/action split "
+                        "logs; first live CONTROL entry is index 9"
+                    ),
+                    "simulator_clock_note": (
+                        "MuJoCo starts at the phase-matched measured source row; "
+                        "the qpos publisher starts at processed_sequence_offset."
+                    ),
+                }
+                if getattr(args, "source_history_prefill", False)
+                else None
+            ),
             "first_control_tick_heading": "cpp_initial_alignment",
             "heading_correction_enabled": args.heading_correction,
             "heading_correction_tick": 1 if args.heading_correction else None,
@@ -1339,12 +1732,23 @@ def _write_manifest(
             "root_assist": args.root_assist,
         },
         "models": {
+            "deploy_binary": str(_selected_deploy_binary(args).resolve()),
+            "deploy_binary_sha256": _sha256(
+                _selected_deploy_binary(args).resolve()
+            ),
             "encoder": str(model.encoder),
             "encoder_sha256": _sha256(model.encoder),
             "decoder": str(model.decoder),
             "decoder_sha256": _sha256(model.decoder),
             "obs_config": str(model.obs_config),
             "obs_config_sha256": _sha256(model.obs_config),
+        },
+        "logging": {
+            "simulator_replay_csv": bool(args.save_csv),
+            "deploy_csv": True,
+            "deploy_prefill_rows": (
+                9 if getattr(args, "source_history_prefill", False) else 0
+            ),
         },
         "commands": {name: list(command) for name, command in commands.items()},
         "preflight": report,
@@ -1790,15 +2194,28 @@ def _add_launch_arguments(parser: argparse.ArgumentParser) -> None:
         action=bool_action,
         default=True,
         help=(
-            "Drop visibly partial first/last policy_seq groups before applying "
-            "--start-policy-offset"
+            "Drop visibly partial first/last groups from the qpos reference; "
+            "this does not change the public offset origin"
         ),
     )
     parser.add_argument(
         "--start-policy-offset",
         type=int,
-        default=0,
-        help="Offset inside the processed qpos sequence (after optional edge trimming)",
+        default=DEFAULT_START_POLICY_OFFSET,
+        help=(
+            "zero-based offset whose origin is always the second raw "
+            "policy_seq group; default 10 selects the 12th raw group"
+        ),
+    )
+    parser.add_argument(
+        "--source-history-prefill",
+        action=bool_action,
+        default=True,
+        help=(
+            "prefill the decoder with the previous nine measured 50 Hz states "
+            "from data.csv and phase-match the initial MuJoCo state (default: "
+            "enabled); use --no-source-history-prefill for zero history"
+        ),
     )
     parser.add_argument(
         "--chunk-size",
@@ -1867,6 +2284,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "run" and not args.dry_run and not args.skip_process_check:
             _check_runtime_conflicts()
         run_dir = _new_run_dir(args, model.name)
+        _prepare_source_history_file(args, run_dir)
         if args.command == "deploy":
             commands = {"deploy": deploy_command(args, model, run_dir / "deploy_csv")}
             _write_manifest(run_dir, args, model, report, commands)

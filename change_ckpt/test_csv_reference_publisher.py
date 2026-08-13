@@ -15,8 +15,10 @@ from change_ckpt.csv_reference_publisher import (
     PROTOCOL_VERSION,
     PUBLISHES_EXTERNAL_TOKEN,
     build_pose_payload,
+    build_parser,
 )
 from change_ckpt.reference_data import (
+    ReferenceDataError,
     quat_multiply_wxyz,
     quat_to_matrix_wxyz,
     load_reference_sequence,
@@ -29,6 +31,10 @@ def _six_d(quat: np.ndarray) -> np.ndarray:
 
 
 class CsvReferencePublisherTest(unittest.TestCase):
+    def test_standalone_parser_has_a_supported_default_layout(self) -> None:
+        args = build_parser().parse_args([])
+        self.assertEqual(args.checkpoint_layout, "low_latency")
+
     def _write_csv(self, path: Path) -> None:
         qpos = [f"qpos:test[qpos{index}]" for index in range(7)]
         reference = [f"reference_motion[{index}]" for index in range(1024)]
@@ -111,6 +117,34 @@ class CsvReferencePublisherTest(unittest.TestCase):
         np.testing.assert_allclose(regular["joint_vel"][offsets, 0], 0.1)
         self.assertEqual(regular["joint_pos"][1, 0], 1.0)
         self.assertEqual(regular["joint_pos"][6, 0], 2.0)
+
+        sonic_v1_1 = build_pose_payload(
+            sequence,
+            0,
+            46,
+            include_hands=False,
+            checkpoint_layout="sonic_v1_1",
+        )
+        self.assertEqual(sonic_v1_1.keys(), regular.keys())
+        for field in regular:
+            np.testing.assert_array_equal(sonic_v1_1[field], regular[field])
+        self.assertNotIn("token_state", sonic_v1_1)
+        self.assertNotIn("reference_motion", sonic_v1_1)
+
+    def test_sonic_v1_1_rejects_short_step_five_packet(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            csv_path = Path(directory) / "data.csv"
+            self._write_csv(csv_path)
+            sequence = load_reference_sequence(csv_path, base_sample_mode="first")
+
+        with self.assertRaisesRegex(ReferenceDataError, "packet_frames >= 46"):
+            build_pose_payload(
+                sequence,
+                0,
+                45,
+                include_hands=False,
+                checkpoint_layout="sonic_v1_1",
+            )
 
     def test_wire_header_is_protocol_v1_without_token(self) -> None:
         self.assertEqual(PROTOCOL_VERSION, 1)

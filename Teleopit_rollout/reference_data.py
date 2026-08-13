@@ -120,6 +120,11 @@ class PreparedReference:
     group_row_counts: np.ndarray
     policy_offset: int
     source_frame_count: int
+    reference_source: str = "qpos"
+    source_reference_joint_vel: np.ndarray | None = None
+    orientation_base_sample_mode: str | None = None
+    policy_alignment_max_time_error_s: float = 0.0
+    policy_alignment_max_hand_error: float = 0.0
 
     def __post_init__(self) -> None:
         source_path = Path(self.source_csv_path).expanduser().resolve()
@@ -138,6 +143,23 @@ class PreparedReference:
             raise PreparedReferenceError("policy_offset must be non-negative")
         if self.source_frame_count <= 0:
             raise PreparedReferenceError("source_frame_count must be positive")
+        if self.reference_source not in ("qpos", "sonic_reference_hybrid"):
+            raise PreparedReferenceError(
+                f"unsupported reference_source {self.reference_source!r}"
+            )
+        if (
+            self.reference_source == "sonic_reference_hybrid"
+            and not self.orientation_base_sample_mode
+        ):
+            raise PreparedReferenceError(
+                "sonic_reference_hybrid requires orientation_base_sample_mode"
+            )
+        for name, value in (
+            ("policy_alignment_max_time_error_s", self.policy_alignment_max_time_error_s),
+            ("policy_alignment_max_hand_error", self.policy_alignment_max_hand_error),
+        ):
+            if not np.isfinite(value) or value < 0.0:
+                raise PreparedReferenceError(f"{name} must be finite and non-negative")
 
         arrays = {
             "qpos36": _readonly_array(
@@ -195,6 +217,13 @@ class PreparedReference:
                 shape=(None,),
             ),
         }
+        if self.source_reference_joint_vel is not None:
+            arrays["source_reference_joint_vel"] = _readonly_array(
+                self.source_reference_joint_vel,
+                name="source_reference_joint_vel",
+                dtype=np.float32,
+                shape=(None, ACTION_DIM),
+            )
         frame_count = int(arrays["policy_seq"].shape[0])
         if frame_count == 0:
             raise PreparedReferenceError("prepared reference is empty")
@@ -279,9 +308,39 @@ class PreparedReference:
     def metadata(self) -> dict[str, Any]:
         """Return JSON-serializable layout and provenance metadata."""
 
+        if self.reference_source == "qpos":
+            reference_kind = "recorded_robot_qpos_track_for_teleopit"
+            component_sources = {
+                "root_translation": "recorded actual qpos",
+                "root_orientation": "recorded actual qpos",
+                "body_joint_position": "recorded actual qpos",
+                "reference_velocity": "50 Hz finite difference of recorded actual qpos pose",
+            }
+        else:
+            reference_kind = "sonic_reference_motion_pose_with_recorded_root_translation"
+            component_sources = {
+                "root_translation": "recorded actual qpos (reference_motion has no root xyz)",
+                "root_orientation": (
+                    "SONIC reference_motion slot-0 relative pelvis orientation "
+                    "recovered in world coordinates using the recorded actual "
+                    "pelvis orientation"
+                ),
+                "body_joint_position": "SONIC reference_motion slot-0 joint position",
+                "reference_velocity": "50 Hz finite difference of the hybrid qpos36 pose",
+                "source_reference_joint_velocity_diagnostic": (
+                    "SONIC reference_motion slot-0 joint velocity"
+                ),
+            }
         return {
             "schema_version": SCHEMA_VERSION,
-            "reference_kind": "recorded_robot_qpos_track_for_teleopit",
+            "reference_kind": reference_kind,
+            "reference_source": self.reference_source,
+            "component_sources": component_sources,
+            "orientation_base_sample_mode": self.orientation_base_sample_mode,
+            "policy_alignment_max_time_error_s": (
+                self.policy_alignment_max_time_error_s
+            ),
+            "policy_alignment_max_hand_error": self.policy_alignment_max_hand_error,
             "source_csv": str(self.source_csv_path),
             "rate_hz": POLICY_HZ,
             "policy_dt_s": 1.0 / POLICY_HZ,
@@ -297,8 +356,11 @@ class PreparedReference:
             "joint_names": list(self.joint_names),
             "hand_target_layout": "left_hand_q[0:7] / right_hand_q[0:7]",
             "recorded_joint_vel_note": (
-                "diagnostic source state only; Teleopit reference velocities "
-                "are finite differences of qpos36 at 50 Hz"
+                "recorded actual qvel retained for diagnostics only; Teleopit "
+                "reference velocities are finite differences of qpos36 at 50 Hz"
+            ),
+            "source_reference_joint_vel_present": (
+                self.source_reference_joint_vel is not None
             ),
         }
 
@@ -321,45 +383,49 @@ class PreparedReference:
             )
         destination.parent.mkdir(parents=True, exist_ok=True)
 
-        np.savez_compressed(
-            destination,
-            qpos36=np.asarray(self.qpos36, dtype=np.float32),
-            root_qpos=np.asarray(self.root_qpos, dtype=np.float32),
-            joint_pos=np.asarray(self.joint_pos, dtype=np.float32),
-            recorded_joint_vel=np.asarray(
+        payload: dict[str, np.ndarray] = {
+            "qpos36": np.asarray(self.qpos36, dtype=np.float32),
+            "root_qpos": np.asarray(self.root_qpos, dtype=np.float32),
+            "joint_pos": np.asarray(self.joint_pos, dtype=np.float32),
+            "recorded_joint_vel": np.asarray(
                 self.recorded_joint_vel, dtype=np.float32
             ),
-            left_hand_target=np.asarray(
+            "left_hand_target": np.asarray(
                 self.left_hand_target, dtype=np.float32
             ),
-            right_hand_target=np.asarray(
+            "right_hand_target": np.asarray(
                 self.right_hand_target, dtype=np.float32
             ),
             # Compatibility aliases used by the existing comparison viewer.
-            left_hand_joints=np.asarray(
+            "left_hand_joints": np.asarray(
                 self.left_hand_target, dtype=np.float32
             ),
-            right_hand_joints=np.asarray(
+            "right_hand_joints": np.asarray(
                 self.right_hand_target, dtype=np.float32
             ),
-            policy_seq=np.asarray(self.policy_seq, dtype=np.int64),
-            control_time_s=np.asarray(self.control_time_s, dtype=np.float64),
-            source_row_index=np.asarray(
+            "policy_seq": np.asarray(self.policy_seq, dtype=np.int64),
+            "control_time_s": np.asarray(self.control_time_s, dtype=np.float64),
+            "source_row_index": np.asarray(
                 self.source_row_index, dtype=np.int64
             ),
-            source_csv_row_number=np.asarray(
+            "source_csv_row_number": np.asarray(
                 self.source_csv_row_number, dtype=np.int64
             ),
-            group_row_counts=np.asarray(
+            "group_row_counts": np.asarray(
                 self.group_row_counts, dtype=np.int32
             ),
-            joint_names=np.asarray(self.joint_names),
-            metadata_json=np.asarray(
+            "joint_names": np.asarray(self.joint_names),
+            "metadata_json": np.asarray(
                 json.dumps(
                     self.metadata(), ensure_ascii=False, sort_keys=True
                 )
             ),
-        )
+        }
+        if self.source_reference_joint_vel is not None:
+            payload["source_reference_joint_vel"] = np.asarray(
+                self.source_reference_joint_vel, dtype=np.float32
+            )
+        np.savez_compressed(destination, **payload)
         return destination
 
 

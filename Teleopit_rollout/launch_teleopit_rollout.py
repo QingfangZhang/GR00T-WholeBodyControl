@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Teleopit v0.5.0 on qpos references inside a recorded task scene.
+"""Run Teleopit v0.5.0 on qpos or SONIC-hybrid references in a recorded scene.
 
 This is a single-process, fixed-simulation-clock experiment.  It does not use
 DDS, ZMQ or a wall-clock reference publisher, so viewer performance cannot
@@ -44,6 +44,7 @@ try:
         sha256_file,
     )
     from .reference_data import PreparedReference, load_prepared_reference
+    from .reference_motion_data import load_reference_motion_prepared_reference
     from .task_simulator import TaskSceneController
     from .teleopit_policy import (
         ReferenceFeatures,
@@ -65,6 +66,7 @@ except ImportError:  # pragma: no cover - direct script execution
         sha256_file,
     )
     from reference_data import PreparedReference, load_prepared_reference
+    from reference_motion_data import load_reference_motion_prepared_reference
     from task_simulator import TaskSceneController
     from teleopit_policy import (
         ReferenceFeatures,
@@ -189,11 +191,20 @@ def resolve_assets(args: argparse.Namespace) -> AssetPaths:
     )
 
 
-def _default_run_name(recording: Path, root_assist: str) -> str:
+def _default_run_name(
+    recording: Path,
+    root_assist: str,
+    reference_source: str = "qpos",
+) -> str:
+    controller = (
+        "teleopit"
+        if reference_source == "qpos"
+        else "teleopit_sonic_reference_hybrid"
+    )
     suffix = (
-        "teleopit_no_root_assist"
+        f"{controller}_no_root_assist"
         if root_assist == "none"
-        else f"teleopit_root_assist_{root_assist}"
+        else f"{controller}_root_assist_{root_assist}"
     )
     return f"{recording.name}_{suffix}"
 
@@ -206,6 +217,7 @@ def prepare_run_directory(
     recording_dir: Path,
     root_assist: str,
     explicit_run_name: bool,
+    reference_source: str = "qpos",
 ) -> Path:
     if not run_name or run_name in (".", "..") or Path(run_name).name != run_name:
         raise ValueError("--run-name must be one plain directory name")
@@ -232,9 +244,13 @@ def prepare_run_directory(
                 )
             previous = _load_json(manifest_path)
             previous_recording = Path(str(previous.get("recording", ""))).resolve()
+            previous_reference_source = str(
+                previous.get("reference_source", "qpos")
+            )
             if (
                 previous_recording != recording_dir.resolve()
                 or previous.get("root_assist") != root_assist
+                or previous_reference_source != reference_source
             ):
                 raise ValueError(
                     "the automatic output name belongs to a different recording/config; "
@@ -579,6 +595,15 @@ def telemetry_summary(telemetry: PolicyTelemetry) -> dict[str, object]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("recording", type=Path, help="recording directory or data.csv")
+    parser.add_argument(
+        "--reference-source",
+        choices=("qpos", "sonic_reference_hybrid"),
+        default="qpos",
+        help=(
+            "body-reference source: recorded robot qpos (default), or SONIC "
+            "reference_motion slot-0 pose with recorded qpos root translation"
+        ),
+    )
     parser.add_argument("--checkpoint", type=Path, help="custom track_g1 ONNX")
     parser.add_argument("--robot-xml", type=Path, help="custom Teleopit FK robot XML")
     parser.add_argument(
@@ -675,12 +700,14 @@ def _adapter_source_hashes() -> dict[str, str]:
     local_names = (
         "constants.py",
         "reference_data.py",
+        "reference_motion_data.py",
         "task_simulator.py",
         "teleopit_policy.py",
         "launch_teleopit_rollout.py",
     )
     result = {name: sha256_file(SCRIPT_DIR / name) for name in local_names}
     for relative in (
+        "change_ckpt/reference_data.py",
         "change_ckpt_track/qpos_reference_data.py",
         "change_ckpt_track/task_sim_io.py",
     ):
@@ -701,11 +728,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     recording_dir, source_csv = resolve_recording(args.recording)
     source_csv_sha256_start = sha256_file(source_csv)
     adapter_source_hashes = _adapter_source_hashes()
-    reference = load_prepared_reference(
-        recording_dir,
-        policy_offset=args.policy_offset,
-        policy_count=args.policy_count,
-    )
+    if args.reference_source == "qpos":
+        reference = load_prepared_reference(
+            recording_dir,
+            policy_offset=args.policy_offset,
+            policy_count=args.policy_count,
+        )
+    else:
+        reference = load_reference_motion_prepared_reference(
+            recording_dir,
+            policy_offset=args.policy_offset,
+            policy_count=args.policy_count,
+        )
     assets = resolve_assets(args)
     timeline = CsvTimeline(
         source_csv,
@@ -750,7 +784,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print(f"[teleopit] source: {source_csv}")
         print(
-            f"[teleopit] reference: frames={reference.num_frames}, "
+            f"[teleopit] reference ({args.reference_source}): "
+            f"frames={reference.num_frames}, "
             f"policy_seq={reference.policy_seq[0]}..{reference.policy_seq[-1]}, "
             f"source_row={reference.first_source_row_index}"
         )
@@ -772,7 +807,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         staged.close()
         staged = None
         run_name = args.run_name or _default_run_name(
-            recording_dir, args.root_assist
+            recording_dir, args.root_assist, args.reference_source
         )
         run_dir = prepare_run_directory(
             args.output_dir,
@@ -781,6 +816,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             recording_dir=recording_dir,
             root_assist=args.root_assist,
             explicit_run_name=args.run_name is not None,
+            reference_source=args.reference_source,
         )
         staged = stage_recording_snapshot(
             recording_dir,
@@ -801,9 +837,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeline.qpos_columns,
             timeline.qvel_columns,
         )
+        experiment_kind = (
+            "teleopit_qpos_track_in_recorded_task_scene"
+            if args.reference_source == "qpos"
+            else "teleopit_sonic_reference_hybrid_in_recorded_task_scene"
+        )
         launch_manifest = {
             "schema_version": 1,
-            "experiment_kind": "teleopit_qpos_track_in_recorded_task_scene",
+            "experiment_kind": experiment_kind,
+            "reference_source": args.reference_source,
+            "reference": reference.metadata(),
             "created_at_unix_s": time.time(),
             "command": [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
             "recording": str(recording_dir),
@@ -901,9 +944,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             task_initial = initial_state_qpos[scene.task_qpos_start :]
             task_final = scene.data.qpos[scene.task_qpos_start :].copy()
             task_source = source_qpos[scene.task_qpos_start :]
+            experiment_kind = (
+                "teleopit_qpos_track_in_recorded_task_scene"
+                if args.reference_source == "qpos"
+                else "teleopit_sonic_reference_hybrid_in_recorded_task_scene"
+            )
             payload: dict[str, Any] = {
                 "schema_version": 1,
-                "experiment_kind": "teleopit_qpos_track_in_recorded_task_scene",
+                "experiment_kind": experiment_kind,
+                "reference_source": args.reference_source,
+                "reference": reference.metadata(),
                 "source_recording": str(recording_dir),
                 "source_csv": str(source_csv),
                 "source_csv_sha256_start": source_csv_sha256_start,
@@ -964,6 +1014,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "reference_motion/token fields in data.csv retain source-schema "
                     "provenance only and are not Teleopit observations. Exact Teleopit "
                     "observations/actions are in teleopit_policy.npz."
+                    if args.reference_source == "qpos"
+                    else "reference_motion slot-0 joint pose and relative pelvis "
+                    "orientation form the Teleopit body reference; recorded qpos "
+                    "supplies root translation and the actual pelvis orientation "
+                    "used to recover that relative target in world coordinates, "
+                    "as well as initialization and provenance. Exact observations/"
+                    "actions are in teleopit_policy.npz."
                 ),
                 "error": error_text,
                 "csv_close_error": close_error,

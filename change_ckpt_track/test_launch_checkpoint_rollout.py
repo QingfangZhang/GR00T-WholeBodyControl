@@ -29,7 +29,8 @@ class QposTrackLauncherTest(unittest.TestCase):
 
     def test_qpos_track_defaults(self) -> None:
         args = launcher.build_parser().parse_args(["run", "--dry-run"])
-        self.assertEqual(args.start_policy_offset, 0)
+        self.assertEqual(args.start_policy_offset, 10)
+        self.assertTrue(args.source_history_prefill)
         self.assertTrue(args.drop_truncated_edges)
         self.assertFalse(args.heading_correction)
         self.assertEqual(args.chunk_size, 100)
@@ -113,7 +114,17 @@ class QposTrackLauncherTest(unittest.TestCase):
         for alias in ("sonic_v1_1", "sonic-v1-1", "v1.1", "v1_1"):
             with self.subTest(alias=alias):
                 args = parser.parse_args(
-                    ["run", "--checkpoint", alias, "--dry-run"]
+                    [
+                        "run",
+                        "--checkpoint",
+                        alias,
+                        "--recording",
+                        str(
+                            launcher.REPO_ROOT
+                            / "sample_data/ztj/20260612/20260612_144127_g1_sim"
+                        ),
+                        "--dry-run",
+                    ]
                 )
                 self.assertEqual(
                     launcher.resolve_model_files(args).name,
@@ -167,18 +178,24 @@ class QposTrackLauncherTest(unittest.TestCase):
             / "sample_data/ztj/20260612/20260612_144127_g1_sim"
         )
         args = launcher.build_parser().parse_args(
-            ["run", "--recording", str(recording), "--dry-run"]
+            [
+                "run",
+                "--recording",
+                str(recording),
+                "--no-source-history-prefill",
+                "--dry-run",
+            ]
         )
         command = launcher.simulator_command(args, Path("/tmp/qpos-track-test"))
         index = command.index("--policy-seq")
-        self.assertEqual(command[index + 1], "20163")
+        self.assertEqual(command[index + 1], "20173")
         self.assertNotIn("--policy-offset", command)
 
         publisher = launcher.publisher_command(
             args, Path("/tmp/qpos-track-test")
         )
         offset_index = publisher.index("--start-policy-offset")
-        self.assertEqual(publisher[offset_index + 1], "0")
+        self.assertEqual(publisher[offset_index + 1], "10")
         self.assertIn("--drop-truncated-edges", publisher)
         timing_index = publisher.index("--regular-future-window")
         self.assertEqual(publisher[timing_index + 1], "canonical")
@@ -241,6 +258,7 @@ class QposTrackLauncherTest(unittest.TestCase):
                 str(recording),
                 "--root-assist",
                 "xy",
+                "--no-source-history-prefill",
                 "--dry-run",
             ]
         )
@@ -329,6 +347,209 @@ class QposTrackLauncherTest(unittest.TestCase):
                     self.assertTrue(marker.is_file())
 
             self.assertNotEqual(assisted_dirs[0], assisted_dirs[1])
+
+
+class SourceHistoryLauncherTest(unittest.TestCase):
+    @staticmethod
+    def _recording() -> Path:
+        return (
+            launcher.REPO_ROOT
+            / "sample_data/ztj/20260612/20260612_144127_g1_sim"
+        )
+
+    def test_source_history_is_default_and_can_be_disabled(self) -> None:
+        parser = launcher.build_parser()
+        baseline = parser.parse_args(["run", "--dry-run"])
+        self.assertTrue(baseline.source_history_prefill)
+        self.assertEqual(
+            launcher._selected_deploy_binary(baseline),
+            launcher.SOURCE_HISTORY_DEPLOY_BINARY,
+        )
+
+        zero_history = parser.parse_args(
+            ["run", "--no-source-history-prefill", "--dry-run"]
+        )
+        self.assertFalse(zero_history.source_history_prefill)
+        self.assertEqual(
+            launcher._selected_deploy_binary(zero_history),
+            launcher.DEPLOY_BINARY,
+        )
+
+    def test_processed_offset_maps_to_raw_group_after_edge_trim(self) -> None:
+        parser = launcher.build_parser()
+
+        # Public offset 10 always means raw offset 11. This recording starts
+        # with a truncated group, so raw offset 11 is processed offset 10.
+        trimmed = parser.parse_args(
+            [
+                "run",
+                "--recording",
+                str(self._recording()),
+                "--start-policy-offset",
+                "10",
+                "--source-history-prefill",
+                "--dry-run",
+            ]
+        )
+        sequence, offset = launcher._selected_reference_frame(trimmed)
+        self.assertEqual(offset, 10)
+        self.assertEqual(int(sequence.policy_seq[offset]), 20173)
+        self.assertEqual(
+            launcher._raw_policy_offset_for_selected_frame(trimmed), 11
+        )
+
+        # Without trimming, the same public offset still selects raw offset 11,
+        # which is now processed offset 11.
+        untrimmed = parser.parse_args(
+            [
+                "run",
+                "--recording",
+                str(self._recording()),
+                "--no-drop-truncated-edges",
+                "--start-policy-offset",
+                "10",
+                "--source-history-prefill",
+                "--dry-run",
+            ]
+        )
+        sequence, offset = launcher._selected_reference_frame(untrimmed)
+        self.assertEqual(offset, 11)
+        self.assertEqual(int(sequence.policy_seq[offset]), 20173)
+        self.assertEqual(
+            launcher._raw_policy_offset_for_selected_frame(untrimmed), 11
+        )
+
+    def test_prefill_deploy_command_uses_isolated_binary_and_payload(self) -> None:
+        args = launcher.build_parser().parse_args(
+            [
+                "run",
+                "--checkpoint",
+                "regular",
+                "--source-history-prefill",
+                "--dry-run",
+            ]
+        )
+        args.source_history_prefill_file = Path(
+            "/tmp/qpos_track_source_history.json"
+        )
+        model = launcher.resolve_model_files(args)
+        command = launcher.deploy_command(
+            args, model, Path("/tmp/qpos_track_source_history_logs")
+        )
+
+        self.assertEqual(command[0], str(launcher.SOURCE_HISTORY_DEPLOY_BINARY))
+        self.assertEqual(command.count("--source-history-prefill-file"), 1)
+        option = command.index("--source-history-prefill-file")
+        self.assertEqual(
+            command[option + 1], "/tmp/qpos_track_source_history.json"
+        )
+
+    def test_prefill_simulator_uses_matched_row_and_initial_state(self) -> None:
+        args = launcher.build_parser().parse_args(
+            [
+                "run",
+                "--recording",
+                str(self._recording()),
+                "--start-policy-offset",
+                "10",
+                "--source-history-prefill",
+                "--dry-run",
+            ]
+        )
+        args.source_history_sim_row_index = 79
+        args.source_history_initial_state_file = Path(
+            "/tmp/qpos_track_source_initial_state.json"
+        )
+        command = launcher.simulator_command(
+            args, Path("/tmp/qpos_track_source_history_run")
+        )
+
+        self.assertEqual(command[command.index("--row-index") + 1], "79")
+        self.assertEqual(
+            command[command.index("--initial-state-json") + 1],
+            "/tmp/qpos_track_source_initial_state.json",
+        )
+        self.assertNotIn("--policy-seq", command)
+        self.assertNotIn("--policy-offset", command)
+
+    def test_offset_and_prefill_are_omitted_from_output_name(self) -> None:
+        parser = launcher.build_parser()
+        with tempfile.TemporaryDirectory() as temporary:
+            baseline_args = parser.parse_args(
+                [
+                    "run",
+                    "--checkpoint",
+                    "regular",
+                    "--recording",
+                    str(self._recording()),
+                    "--output-root",
+                    temporary,
+                    "--no-source-history-prefill",
+                    "--dry-run",
+                ]
+            )
+            baseline = launcher._new_run_dir(baseline_args, "regular")
+            marker = baseline / "keep_baseline.txt"
+            marker.write_text("keep", encoding="utf-8")
+
+            prefill_args = parser.parse_args(
+                [
+                    "run",
+                    "--checkpoint",
+                    "regular",
+                    "--recording",
+                    str(self._recording()),
+                    "--output-root",
+                    temporary,
+                    "--start-policy-offset",
+                    "10",
+                    "--source-history-prefill",
+                    "--dry-run",
+                ]
+            )
+            prefilled = launcher._new_run_dir(prefill_args, "regular")
+
+            self.assertEqual(
+                prefilled.name,
+                "20260612_144127_g1_sim_regular",
+            )
+            self.assertEqual(prefilled, baseline)
+            self.assertFalse(marker.exists())
+
+    def test_complete_and_truncated_first_groups_share_public_offset_semantics(self) -> None:
+        parser = launcher.build_parser()
+        cases = (
+            ("20260612_144127_g1_sim", 10, 20173),
+            ("20260612_144154_g1_sim", 11, 21543),
+        )
+        for name, expected_processed, expected_seq in cases:
+            with self.subTest(recording=name):
+                recording = (
+                    launcher.REPO_ROOT / "sample_data/ztj/20260612" / name
+                )
+                args = parser.parse_args(
+                    [
+                        "run",
+                        "--recording",
+                        str(recording),
+                        "--start-policy-offset",
+                        "10",
+                        "--dry-run",
+                    ]
+                )
+                sequence, processed = launcher._selected_reference_frame(args)
+                self.assertEqual(processed, expected_processed)
+                self.assertEqual(int(sequence.policy_seq[processed]), expected_seq)
+                self.assertEqual(
+                    launcher._raw_policy_offset_for_selected_frame(args), 11
+                )
+                publisher = launcher.publisher_command(
+                    args, Path("/tmp/qpos-track-offset-test")
+                )
+                self.assertEqual(
+                    publisher[publisher.index("--start-policy-offset") + 1],
+                    str(expected_processed),
+                )
 
 
 if __name__ == "__main__":
