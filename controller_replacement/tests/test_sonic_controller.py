@@ -141,10 +141,15 @@ def _state(
             if quaternion is None
             else np.asarray(quaternion, dtype=np.float64)
         ),
-        root_ang_vel_b=(
+        sonic_base_ang_vel_qvel=(
             np.zeros(3, dtype=np.float64)
             if angular_velocity is None
             else np.asarray(angular_velocity, dtype=np.float64)
+        ),
+        # Deliberately different: SONIC must never consume Teleopit's
+        # pelvis-link-local angular-velocity field.
+        teleopit_pelvis_ang_vel_b=np.asarray(
+            [91.0, 92.0, 93.0], dtype=np.float64
         ),
         left_hand_pos=np.arange(7, dtype=np.float64) / 100.0,
         right_hand_pos=-np.arange(7, dtype=np.float64) / 100.0,
@@ -245,12 +250,47 @@ class SonicControllerUnitTest(unittest.TestCase):
         )
 
     def test_action_to_q_target_matches_cpp_order_and_formula(self) -> None:
+        # Independent golden values from the released C++ g1_action_scale
+        # table.  Keep this separate from the Python numerator/stiffness
+        # constants so renaming the old, misleading torque-limit constant can
+        # never change q_target scaling unnoticed.
+        scale_7520_22 = 0.3506614663788243
+        scale_7520_14 = 0.5475464652142304
+        scale_5020 = 0.43857731392336724
+        scale_4010 = 0.07450087032950714
+        expected_scale = np.asarray(
+            [
+                scale_7520_22, scale_7520_22, scale_7520_14,
+                scale_7520_22, scale_5020, scale_5020,
+                scale_7520_22, scale_7520_22, scale_7520_14,
+                scale_7520_22, scale_5020, scale_5020,
+                scale_7520_14, scale_5020, scale_5020,
+                scale_5020, scale_5020, scale_5020, scale_5020,
+                scale_5020, scale_4010, scale_4010,
+                scale_5020, scale_5020, scale_5020, scale_5020,
+                scale_5020, scale_4010, scale_4010,
+            ],
+            dtype=np.float64,
+        )
+        np.testing.assert_allclose(
+            ACTION_SCALE_MUJOCO, expected_scale, rtol=0.0, atol=1e-15
+        )
         raw_action = np.linspace(-1.0, 1.0, 29)
         actual = action_to_q_target(raw_action)
         expected = DEFAULT_DOF_POS_MUJOCO + (
             raw_action[ISAACLAB_INDEX_FOR_MUJOCO] * ACTION_SCALE_MUJOCO
         )
         np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-12)
+
+    def test_sonic_has_no_controller_side_applied_torque_cap(self) -> None:
+        controller, _, _ = _fake_controller("regular")
+        self.assertIsNone(controller.torque_limit)
+        metadata = controller.metadata()["pd"]
+        self.assertIsNone(metadata["controller_torque_limit"])
+        self.assertEqual(
+            metadata["applied_torque_limit"],
+            "staged MuJoCo actuator ctrlrange",
+        )
 
     def test_source_prefill_drives_first_decoder_history_without_zero_padding(self) -> None:
         entries = []
@@ -298,6 +338,7 @@ class SonicControllerUnitTest(unittest.TestCase):
             ),
             _identity_reference(),
         )
+        self.assertIsNone(result.torque_limit)
         self.assertEqual(result.history.shape, (10, 93))
         self.assertEqual(result.received_dof_pos.shape, (43,))
         np.testing.assert_allclose(
@@ -312,6 +353,7 @@ class SonicControllerUnitTest(unittest.TestCase):
             atol=1e-8,
         )
         np.testing.assert_allclose(result.last_action, current_last_action, atol=2e-8)
+        np.testing.assert_allclose(result.history[-1, :3], [0.1, 0.2, 0.3])
         np.testing.assert_allclose(result.history[-1, 3:32], current_body_q, atol=2e-8)
         self.assertIsNotNone(decoder.last_input)
         self.assertEqual(decoder.last_input.shape, (1, DECODER_INPUT_DIM))

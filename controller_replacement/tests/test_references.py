@@ -6,8 +6,10 @@ import csv
 from dataclasses import replace
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -285,6 +287,106 @@ class ReferenceProviderTest(unittest.TestCase):
             selected.provenance.selected_policy_offset,
             sequence.provenance.selected_policy_offset + 2,
         )
+
+    def test_prepared_reference_round_trip_is_complete_and_pickle_free(self) -> None:
+        sequence = load_reference(
+            self.recording,
+            mode="reference_motion",
+            policy_offset=1,
+            policy_count=3,
+        )
+        output = Path(self.temp.name) / "artifacts" / "prepared_reference.npz"
+        self.assertEqual(sequence.save_prepared_npz(output), output)
+
+        with np.load(output, allow_pickle=False) as archive:
+            expected_arrays = {
+                "policy_seq",
+                "control_time_s",
+                "source_row_index",
+                "source_csv_row_number",
+                "group_row_counts",
+                "source_root_pos",
+                "source_root_quat_wxyz",
+                "left_hand_target",
+                "right_hand_target",
+                "sonic_regular_joint_pos",
+                "sonic_regular_joint_vel",
+                "sonic_regular_anchor_quat_wxyz",
+                "sonic_consecutive_joint_pos",
+                "sonic_consecutive_joint_vel",
+                "sonic_consecutive_anchor_quat_wxyz",
+                "teleopit_qpos36",
+                "teleopit_reference_joint_vel",
+                "source_reference_motion",
+                "source_recorded_relative_anchor_6d",
+            }
+            self.assertTrue(expected_arrays.issubset(archive.files))
+            self.assertIn("sonic_joint_names", archive.files)
+            self.assertIn("teleopit_joint_names", archive.files)
+            self.assertIn("source_csv_sha256", archive.files)
+            self.assertIn("metadata_json", archive.files)
+            self.assertTrue(all(not archive[name].dtype.hasobject for name in archive.files))
+            metadata = json.loads(str(archive["metadata_json"].item()))
+            self.assertEqual(metadata["prepared_reference_format_version"], 3)
+            self.assertEqual(
+                metadata["source_csv_sha256"],
+                str(archive["source_csv_sha256"].item()),
+            )
+            self.assertEqual(
+                metadata["optional_arrays"],
+                {
+                    "source_recorded_relative_anchor_6d": True,
+                    "source_reference_motion": True,
+                },
+            )
+
+        restored = type(sequence).load_prepared_npz(output)
+        self.assertEqual(restored.metadata(), sequence.metadata())
+        for name in expected_arrays:
+            np.testing.assert_array_equal(getattr(restored, name), getattr(sequence, name))
+            self.assertFalse(getattr(restored, name).flags.writeable)
+
+        relocated = Path(self.temp.name) / "relocated_data.csv"
+        shutil.copy2(sequence.source_csv_path, relocated)
+        type(sequence).load_prepared_npz(output, source_csv_path=relocated)
+        with relocated.open("a", encoding="utf-8") as stream:
+            stream.write("\n")
+        with self.assertRaisesRegex(ReferenceError, "SHA-256 mismatch"):
+            type(sequence).load_prepared_npz(output, source_csv_path=relocated)
+
+    def test_prepared_reference_round_trip_preserves_absent_optional_arrays(self) -> None:
+        sequence = load_reference(
+            self.recording,
+            mode="executed_qpos",
+            policy_offset=1,
+            policy_count=2,
+        )
+        output = Path(self.temp.name) / "prepared_qpos_reference.npz"
+        sequence.save_prepared_npz(output)
+        with np.load(output, allow_pickle=False) as archive:
+            self.assertNotIn("source_reference_motion", archive.files)
+            self.assertNotIn("source_recorded_relative_anchor_6d", archive.files)
+            self.assertFalse(archive["source_reference_motion__present"].item())
+            self.assertFalse(
+                archive["source_recorded_relative_anchor_6d__present"].item()
+            )
+        restored = type(sequence).load_prepared_npz(output)
+        self.assertIsNone(restored.source_reference_motion)
+        self.assertIsNone(restored.source_recorded_relative_anchor_6d)
+        self.assertEqual(restored.metadata(), sequence.metadata())
+
+    def test_prepared_reference_write_is_atomic_on_failure(self) -> None:
+        sequence = load_reference(self.recording, mode="executed_qpos", policy_count=1)
+        output = Path(self.temp.name) / "prepared_reference.npz"
+        output.write_bytes(b"existing-complete-artifact")
+        with mock.patch(
+            "controller_replacement.references.base.np.savez_compressed",
+            side_effect=RuntimeError("injected write failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "injected write failure"):
+                sequence.save_prepared_npz(output)
+        self.assertEqual(output.read_bytes(), b"existing-complete-artifact")
+        self.assertEqual(list(output.parent.glob(f".{output.name}.*.tmp")), [])
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ from Teleopit_rollout.constants import (
     LEFT_HAND_JOINT_NAMES,
     RIGHT_HAND_JOINT_NAMES,
 )
+from controller_replacement.hand_control import HandTorqueProfile
 
 
 FloatArray = np.ndarray
@@ -87,7 +88,13 @@ class SceneState:
     joint_vel: FloatArray
     root_pos: FloatArray
     root_quat_wxyz: FloatArray
-    root_ang_vel_b: FloatArray
+    # SONIC's released MuJoCo bridge forwards the free-joint angular velocity
+    # directly.  Teleopit instead consumes the pelvis-link angular velocity in
+    # the pelvis frame.  These are intentionally separate fields: sharing one
+    # ambiguous ``root_ang_vel_b`` silently mixed two observation contracts.
+    sonic_base_ang_vel_qvel: FloatArray
+    teleopit_pelvis_ang_vel_b: FloatArray
+    teleopit_torso_height_m: float
     timestamp_s: float
     left_hand_pos: FloatArray
     left_hand_vel: FloatArray
@@ -104,13 +111,15 @@ class AppliedPdCommand:
     body_q_target: FloatArray
     body_kp: FloatArray
     body_kd: FloatArray
-    body_torque_limit: FloatArray
+    body_torque_limit: FloatArray | None
     body_torque: FloatArray
     body_torque_saturation: FloatArray
     left_hand_target: FloatArray
     right_hand_target: FloatArray
     left_hand_torque: FloatArray
     right_hand_torque: FloatArray
+    left_hand_torque_saturation: FloatArray
+    right_hand_torque_saturation: FloatArray
 
     def csv_command_fields(self) -> dict[str, FloatArray]:
         """Return fields whose legacy CSV semantics are controller-neutral."""
@@ -156,6 +165,8 @@ class ContactSummary:
 class RootAssistStatistics:
     mode: str
     ticks: int = 0
+    source_velocity_active_ticks: int = 0
+    zero_velocity_fallback_ticks: int = 0
     squared_error_sum: float = 0.0
     maximum_error: float = 0.0
 
@@ -167,9 +178,13 @@ class RootAssistStatistics:
     def enabled(self) -> bool:
         return self.mode == "xy"
 
-    def update(self, error: FloatArray) -> None:
+    def update(self, error: FloatArray, *, source_velocity_active: bool) -> None:
         magnitude = float(np.linalg.norm(error))
         self.ticks += 1
+        if source_velocity_active:
+            self.source_velocity_active_ticks += 1
+        else:
+            self.zero_velocity_fallback_ticks += 1
         self.squared_error_sum += magnitude * magnitude
         self.maximum_error = max(self.maximum_error, magnitude)
 
@@ -178,7 +193,10 @@ class RootAssistStatistics:
             "mode": self.mode,
             "enabled": self.enabled,
             "position_components": ["x", "y"] if self.enabled else [],
+            "velocity_components": ["x", "y"] if self.enabled else [],
             "ticks": self.ticks,
+            "source_velocity_active_ticks": self.source_velocity_active_ticks,
+            "zero_velocity_fallback_ticks": self.zero_velocity_fallback_ticks,
             "pre_alignment_error_rms_m": (
                 float(np.sqrt(self.squared_error_sum / self.ticks))
                 if self.ticks
@@ -186,7 +204,19 @@ class RootAssistStatistics:
             ),
             "pre_alignment_error_max_m": self.maximum_error,
             "position_update": (
-                "hard overwrite after each 200 Hz PD interval"
+                "qpos[:2] hard overwrite at each 200 Hz PD boundary"
+                if self.enabled
+                else "none"
+            ),
+            "velocity_update": (
+                "qvel[:2] hard overwrite from phase-matched source while "
+                "available; otherwise hard overwrite with zero"
+                if self.enabled
+                else "none"
+            ),
+            "terminal_endpoint_update": (
+                "none; control horizon is half-open [0,T), so the state at T "
+                "is the physical result of the final assisted PD interval"
                 if self.enabled
                 else "none"
             ),
@@ -202,6 +232,9 @@ class DeterministicTaskScene:
         scene_xml: str | Path,
         *,
         root_assist: str = "none",
+        hand_torque_profile: HandTorqueProfile | str = (
+            HandTorqueProfile.SONIC_RELEASE
+        ),
         enforce_physics_dt: float = PHYSICS_DT_S,
     ) -> None:
         self.scene_xml = Path(scene_xml).expanduser().resolve()
@@ -220,6 +253,7 @@ class DeterministicTaskScene:
                 f"{enforce_physics_dt:g}s; got {self.model.opt.timestep:g}s"
             )
         self.root_assist = RootAssistStatistics(root_assist)
+        self.hand_torque_profile = HandTorqueProfile.parse(hand_torque_profile)
 
         self.body_joint_ids = self._joint_ids(G1_JOINT_NAMES)
         self.left_hand_joint_ids = self._joint_ids(LEFT_HAND_JOINT_NAMES)
@@ -298,6 +332,7 @@ class DeterministicTaskScene:
         if self.model.nq < self.task_qpos_start:
             raise ValueError(f"task model nq={self.model.nq} is smaller than 50")
         self.pelvis_body_id = _named_id(self.model, "body", "pelvis")
+        self.torso_body_id = _named_id(self.model, "body", "torso_link")
         self.task_qpos_labels = _qpos_labels(self.model, self.task_qpos_start)
         self.robot_body_ids = frozenset(
             {
@@ -312,7 +347,7 @@ class DeterministicTaskScene:
         self.body_q_target = np.zeros(29, dtype=np.float64)
         self.body_kp = np.zeros(29, dtype=np.float64)
         self.body_kd = np.zeros(29, dtype=np.float64)
-        self.body_torque_limit = np.zeros(29, dtype=np.float64)
+        self.body_torque_limit: FloatArray | None = None
         self.left_hand_desired = np.zeros(7, dtype=np.float64)
         self.right_hand_desired = np.zeros(7, dtype=np.float64)
         self.left_hand_applied = np.zeros(7, dtype=np.float64)
@@ -367,13 +402,13 @@ class DeterministicTaskScene:
         self.last_applied_command = None
 
     def state(self) -> SceneState:
-        velocity = np.zeros(6, dtype=np.float64)
+        pelvis_velocity_local = np.zeros(6, dtype=np.float64)
         mujoco.mj_objectVelocity(
             self.model,
             self.data,
             mujoco.mjtObj.mjOBJ_BODY,
             self.pelvis_body_id,
-            velocity,
+            pelvis_velocity_local,
             1,
         )
         xml_robot_joint_pos = self.data.qpos[
@@ -394,7 +429,15 @@ class DeterministicTaskScene:
             joint_vel=self.body_joint_vel.astype(np.float32),
             root_pos=self.data.qpos[0:3].astype(np.float32, copy=True),
             root_quat_wxyz=self.data.qpos[3:7].astype(np.float32, copy=True),
-            root_ang_vel_b=velocity[0:3].astype(np.float32, copy=True),
+            sonic_base_ang_vel_qvel=self.data.qvel[3:6].astype(
+                np.float32, copy=True
+            ),
+            teleopit_pelvis_ang_vel_b=pelvis_velocity_local[0:3].astype(
+                np.float32, copy=True
+            ),
+            teleopit_torso_height_m=float(
+                self.data.xpos[self.torso_body_id, 2]
+            ),
             timestamp_s=float(self.data.time),
             left_hand_pos=self.left_hand_joint_pos.astype(np.float32),
             left_hand_vel=self.data.qvel[self.left_hand_dof_addresses].astype(
@@ -414,19 +457,23 @@ class DeterministicTaskScene:
         q_target: Any,
         kp: Any,
         kd: Any,
-        torque_limit: Any,
+        torque_limit: Any | None,
         left_hand_target: Any,
         right_hand_target: Any,
     ) -> None:
         self.body_q_target[:] = _finite_vector(q_target, 29, "body q_target")
         self.body_kp[:] = _finite_vector(kp, 29, "body kp")
         self.body_kd[:] = _finite_vector(kd, 29, "body kd")
-        self.body_torque_limit[:] = _finite_vector(
-            torque_limit, 29, "body torque_limit"
+        self.body_torque_limit = (
+            None
+            if torque_limit is None
+            else _finite_vector(torque_limit, 29, "body torque_limit").copy()
         )
         if np.any(self.body_kp < 0.0) or np.any(self.body_kd < 0.0):
             raise ValueError("body Kp/Kd must be non-negative")
-        if np.any(self.body_torque_limit <= 0.0):
+        if self.body_torque_limit is not None and np.any(
+            self.body_torque_limit <= 0.0
+        ):
             raise ValueError("body torque limits must be positive")
         self.left_hand_desired[:] = np.clip(
             _finite_vector(left_hand_target, 7, "left hand target"),
@@ -452,14 +499,75 @@ class DeterministicTaskScene:
             result[limited] = clipped
         return result, saturated
 
+    def _actuator_ranges(
+        self, actuator_ids: FloatArray
+    ) -> tuple[FloatArray, FloatArray]:
+        """Return XML lower/upper bounds, using infinities when unlimited."""
+
+        lower = np.full(len(actuator_ids), -np.inf, dtype=np.float64)
+        upper = np.full(len(actuator_ids), np.inf, dtype=np.float64)
+        limited = self.model.actuator_ctrllimited[actuator_ids].astype(bool)
+        ranges = self.model.actuator_ctrlrange[actuator_ids]
+        lower[limited] = ranges[limited, 0]
+        upper[limited] = ranges[limited, 1]
+        return lower, upper
+
+    @staticmethod
+    def _json_range(value: FloatArray) -> list[float | None]:
+        return [float(item) if np.isfinite(item) else None for item in value]
+
+    def hand_control_metadata(self) -> dict[str, object]:
+        """Describe the complete hand target/PD/torque-limiting contract."""
+
+        profile = self.hand_torque_profile.metadata()
+        software_limit = self.hand_torque_profile.software_torque_limit_nm
+        sides: dict[str, object] = {}
+        for side, actuator_ids, joint_names in (
+            ("left", self.left_hand_actuator_ids, LEFT_HAND_JOINT_NAMES),
+            ("right", self.right_hand_actuator_ids, RIGHT_HAND_JOINT_NAMES),
+        ):
+            xml_lower, xml_upper = self._actuator_ranges(actuator_ids)
+            effective_lower = xml_lower.copy()
+            effective_upper = xml_upper.copy()
+            if software_limit is not None:
+                effective_lower = np.maximum(effective_lower, -software_limit)
+                effective_upper = np.minimum(effective_upper, software_limit)
+            if np.any(effective_lower > effective_upper):
+                raise ValueError(
+                    f"{side} hand profile and XML actuator ranges do not intersect"
+                )
+            sides[side] = {
+                "joint_names": list(joint_names),
+                "xml_ctrlrange_lower_nm": self._json_range(xml_lower),
+                "xml_ctrlrange_upper_nm": self._json_range(xml_upper),
+                "effective_lower_nm": self._json_range(effective_lower),
+                "effective_upper_nm": self._json_range(effective_upper),
+            }
+        return {
+            **profile,
+            "kp": float(HAND_KP),
+            "kd": float(HAND_KD),
+            "maximum_target_delta_rad_per_200hz_update": float(
+                HAND_MAX_TARGET_DELTA
+            ),
+            "torque_limit_application_order": [
+                "hand_torque_profile",
+                "staged_mujoco_actuator_ctrlrange",
+            ],
+            "sides": sides,
+        }
+
     def update_pd(self) -> AppliedPdCommand:
         body_q = self.body_joint_pos
         body_dq = self.body_joint_vel
         raw_body_tau = self.body_kp * (self.body_q_target - body_q) - self.body_kd * body_dq
-        body_tau = np.clip(
-            raw_body_tau, -self.body_torque_limit, self.body_torque_limit
-        )
-        body_saturation = body_tau != raw_body_tau
+        body_tau = raw_body_tau.copy()
+        body_saturation = np.zeros(body_tau.shape, dtype=np.bool_)
+        if self.body_torque_limit is not None:
+            body_tau = np.clip(
+                body_tau, -self.body_torque_limit, self.body_torque_limit
+            )
+            body_saturation |= body_tau != raw_body_tau
         body_tau, actuator_saturation = self._clip_actuator(
             body_tau, self.body_actuator_ids
         )
@@ -481,8 +589,18 @@ class DeterministicTaskScene:
         right_dq = self.data.qvel[self.right_hand_dof_addresses]
         left_tau = HAND_KP * (self.left_hand_applied - left_q) - HAND_KD * left_dq
         right_tau = HAND_KP * (self.right_hand_applied - right_q) - HAND_KD * right_dq
-        left_tau, _ = self._clip_actuator(left_tau, self.left_hand_actuator_ids)
-        right_tau, _ = self._clip_actuator(right_tau, self.right_hand_actuator_ids)
+        left_tau, left_profile_saturation = self.hand_torque_profile.clip(left_tau)
+        right_tau, right_profile_saturation = self.hand_torque_profile.clip(
+            right_tau
+        )
+        left_tau, left_xml_saturation = self._clip_actuator(
+            left_tau, self.left_hand_actuator_ids
+        )
+        right_tau, right_xml_saturation = self._clip_actuator(
+            right_tau, self.right_hand_actuator_ids
+        )
+        left_hand_saturation = left_profile_saturation | left_xml_saturation
+        right_hand_saturation = right_profile_saturation | right_xml_saturation
 
         self.data.ctrl[:] = 0.0
         self.data.ctrl[self.body_actuator_ids] = body_tau
@@ -495,13 +613,19 @@ class DeterministicTaskScene:
             body_q_target=self.body_q_target.copy(),
             body_kp=self.body_kp.copy(),
             body_kd=self.body_kd.copy(),
-            body_torque_limit=self.body_torque_limit.copy(),
+            body_torque_limit=(
+                None
+                if self.body_torque_limit is None
+                else self.body_torque_limit.copy()
+            ),
             body_torque=body_tau.copy(),
             body_torque_saturation=body_saturation.copy(),
             left_hand_target=self.left_hand_applied.copy(),
             right_hand_target=self.right_hand_applied.copy(),
             left_hand_torque=left_tau.copy(),
             right_hand_torque=right_tau.copy(),
+            left_hand_torque_saturation=left_hand_saturation.copy(),
+            right_hand_torque_saturation=right_hand_saturation.copy(),
         )
         self.last_applied_command = command
         return command
@@ -527,7 +651,10 @@ class DeterministicTaskScene:
         self.data.qvel[:2] = qvel[:2] if source_velocity_active else 0.0
         self.data.qacc_warmstart[:] = 0.0
         mujoco.mj_forward(self.model, self.data)
-        self.root_assist.update(error)
+        self.root_assist.update(
+            error,
+            source_velocity_active=source_velocity_active,
+        )
 
     def validate_state(self) -> None:
         if not np.all(np.isfinite(self.data.qpos)) or not np.all(
@@ -588,6 +715,7 @@ __all__ = [
     "AppliedPdCommand",
     "ContactSummary",
     "DeterministicTaskScene",
+    "HandTorqueProfile",
     "LOG_HZ",
     "PD_HZ",
     "PHYSICS_DT_S",

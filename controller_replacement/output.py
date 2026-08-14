@@ -33,6 +33,7 @@ import numpy as np
 
 
 FORMAT_VERSION = 1
+PROTOCOL_REVISION = 2
 DEFAULT_LOGGING_HZ = 400.0
 
 
@@ -101,10 +102,13 @@ def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
 class PolicySnapshot:
     """One controller inference, held over subsequent high-rate CSV rows.
 
-    For a SONIC run, ``token``, ``last_action``, ``raw_action``, and
-    ``received_dof_pos`` are mandatory.  For a non-SONIC run they are ignored
-    by the legacy CSV writer, whose SONIC-only fields are explicitly zeroed.
-    Controller-native non-SONIC values belong in ``policy_telemetry.npz``.
+    ``received_dof_pos`` is controller-neutral: it is the measured 43-DoF
+    robot state captured at the controller-inference boundary and is mandatory
+    for every controller family.  For a SONIC run, ``token``, ``last_action``,
+    and ``raw_action`` are mandatory as well.  For a non-SONIC run those
+    SONIC-only values are
+    ignored and explicitly zeroed in the legacy CSV.  Controller-native
+    non-SONIC values belong in ``policy_telemetry.npz``.
     """
 
     policy_seq: int
@@ -164,7 +168,10 @@ class ReplayCsvWriter:
 
     ``controller_family`` values beginning with ``"sonic"`` (case-insensitive)
     are treated as SONIC.  All other controllers get zero in the legacy SONIC
-    policy fields and ``policy_valid=policy_token_size=0``.
+    token/action/reference fields and ``policy_valid=policy_token_size=0``.
+    ``policy_received_dof_pos`` remains a real, held measurement for every
+    controller family; ``policy_valid=0`` therefore means that SONIC
+    supervision is unavailable, not that the whole policy snapshot is absent.
     """
 
     def __init__(
@@ -313,12 +320,24 @@ class ReplayCsvWriter:
 
         if int(snapshot.policy_seq) < 0:
             raise ValueError("policy_seq must be non-negative")
+        if snapshot.received_dof_pos is None:
+            raise ValueError("policy snapshot is missing controller-neutral received_dof_pos")
+        if not self.received_columns:
+            raise ValueError("source schema has no policy_received_dof_pos columns")
+        received_dof_pos = _as_numeric_array(
+            snapshot.received_dof_pos, name="received_dof_pos"
+        ).reshape(-1)
+        if received_dof_pos.size != len(self.received_columns):
+            raise ValueError(
+                "received_dof_pos has "
+                f"{received_dof_pos.size} values but data.csv capacity is "
+                f"{len(self.received_columns)}"
+            )
         if self.is_sonic:
             required = {
                 "token": snapshot.token,
                 "last_action": snapshot.last_action,
                 "raw_action": snapshot.raw_action,
-                "received_dof_pos": snapshot.received_dof_pos,
             }
             missing = [name for name, value in required.items() if value is None]
             if missing:
@@ -331,7 +350,6 @@ class ReplayCsvWriter:
             for name, value, columns in (
                 ("last_action", snapshot.last_action, self.last_action_columns),
                 ("raw_action", snapshot.raw_action, self.raw_action_columns),
-                ("received_dof_pos", snapshot.received_dof_pos, self.received_columns),
             ):
                 if not columns:
                     raise ValueError(f"SONIC source schema has no {name} columns")
@@ -345,12 +363,15 @@ class ReplayCsvWriter:
                 token=token,
                 last_action=_as_numeric_array(snapshot.last_action, name="last_action").reshape(-1),
                 raw_action=_as_numeric_array(snapshot.raw_action, name="raw_action").reshape(-1),
-                received_dof_pos=_as_numeric_array(
-                    snapshot.received_dof_pos, name="received_dof_pos"
-                ).reshape(-1),
+                received_dof_pos=received_dof_pos,
             )
         else:
-            snapshot = PolicySnapshot(policy_seq=int(snapshot.policy_seq))
+            # Deliberately discard any accidentally supplied SONIC-only arrays,
+            # but preserve the controller-neutral measured state.
+            snapshot = PolicySnapshot(
+                policy_seq=int(snapshot.policy_seq),
+                received_dof_pos=received_dof_pos,
+            )
         self._policy_snapshot = snapshot
 
     def _apply_policy(self, row: list[Any]) -> None:
@@ -358,13 +379,19 @@ class ReplayCsvWriter:
         if snapshot is not None and "policy_seq" in self.column:
             row[self.column["policy_seq"]] = str(snapshot.policy_seq)
 
-        policy_columns = (
+        sonic_policy_columns = (
             *self.token_columns,
             *self.last_action_columns,
             *self.raw_action_columns,
-            *self.received_columns,
         )
-        self._clear(row, policy_columns)
+        self._clear(row, sonic_policy_columns)
+        self._clear(row, self.received_columns)
+        if snapshot is None:
+            raise RuntimeError("set a policy snapshot before writing its first CSV frame")
+        assert snapshot.received_dof_pos is not None
+        self._assign_vector(
+            row, self.received_columns, snapshot.received_dof_pos, name="received_dof_pos"
+        )
         if not self.is_sonic:
             if "policy_valid" in self.column:
                 row[self.column["policy_valid"]] = "0"
@@ -372,20 +399,14 @@ class ReplayCsvWriter:
                 row[self.column["policy_token_size"]] = "0"
             return
 
-        if snapshot is None:
-            raise RuntimeError("set a SONIC policy snapshot before writing its first CSV frame")
         assert snapshot.token is not None
         assert snapshot.last_action is not None
         assert snapshot.raw_action is not None
-        assert snapshot.received_dof_pos is not None
         row[self.column["policy_valid"]] = "1"
         row[self.column["policy_token_size"]] = str(np.asarray(snapshot.token).size)
         self._assign_vector(row, self.token_columns, snapshot.token, name="token", exact=False)
         self._assign_vector(row, self.last_action_columns, snapshot.last_action, name="last_action")
         self._assign_vector(row, self.raw_action_columns, snapshot.raw_action, name="raw_action")
-        self._assign_vector(
-            row, self.received_columns, snapshot.received_dof_pos, name="received_dof_pos"
-        )
 
     def _apply_reference_motion(
         self,
@@ -454,8 +475,8 @@ class ReplayCsvWriter:
             self._apply_command_fields(row, command_fields)
         self._apply_reference_motion(
             row,
-            reference_motion,
-            clear_when_none=bool(clear_reference_motion),
+            reference_motion if self.is_sonic else None,
+            clear_when_none=bool(clear_reference_motion) or not self.is_sonic,
         )
         # Apply policy last so a generic command cannot accidentally leave stale
         # SONIC internals in a non-SONIC run.
@@ -649,6 +670,7 @@ class ControllerTelemetryWriter:
         records = self._records
         payload: dict[str, np.ndarray] = {
             "format_version": np.asarray(FORMAT_VERSION, dtype=np.int64),
+            "protocol_revision": np.asarray(PROTOCOL_REVISION, dtype=np.int64),
             "controller_name": np.asarray(self.controller_name),
             "controller_family": np.asarray(self.controller_family),
             "metadata_json": np.asarray(
@@ -705,6 +727,7 @@ def write_data_schema(
     controller_family: str,
     source_csv: Path | None = None,
     logging_hz: float = DEFAULT_LOGGING_HZ,
+    generated_command_fields: Sequence[str] = (),
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write ``data_schema.json`` describing the compatible CSV contract."""
@@ -725,9 +748,70 @@ def write_data_schema(
         "policy_received_dof_pos": [
             name for name in header if name.startswith("policy_received_dof_pos[")
         ],
+        "reference_motion": [
+            name for name in header if name.startswith("reference_motion[")
+        ],
     }
+    command_columns: list[str] = []
+    for field_name in generated_command_fields:
+        if field_name in header:
+            command_columns.append(str(field_name))
+        command_columns.extend(
+            name for name in header if name.startswith(f"{field_name}[")
+        )
+    command_columns = list(dict.fromkeys(command_columns))
+    groups["generated_command"] = command_columns
+
+    simulation_generated = {
+        *groups["qpos"],
+        *groups["qvel"],
+        *command_columns,
+        *(
+            name
+            for name in (
+                "scene_path",
+                "sample_index",
+                "control_time_s",
+                "mujoco_time_s",
+            )
+            if name in header
+        ),
+    }
+    policy_snapshot = {
+        *groups["policy_received_dof_pos"],
+        *(name for name in ("policy_seq",) if name in header),
+    }
+    sonic_only = {
+        *groups["token_state"],
+        *groups["policy_last_action_in"],
+        *groups["policy_raw_action_out"],
+        *groups["reference_motion"],
+        *(
+            name
+            for name in (
+                "policy_valid",
+                "policy_token_size",
+                "policy_reference_motion_size",
+            )
+            if name in header
+        ),
+    }
+    policy_generated_or_zero_padded = sonic_only if is_sonic else set()
+    explicitly_zeroed = set() if is_sonic else sonic_only
+    classified = (
+        simulation_generated
+        | policy_snapshot
+        | policy_generated_or_zero_padded
+        | explicitly_zeroed
+    )
+    source_passthrough = {name for name in header if name not in classified}
+
+    def ordered(columns: set[str]) -> list[str]:
+        return [name for name in header if name in columns]
+
     payload: dict[str, Any] = {
         "format_version": FORMAT_VERSION,
+        "protocol_revision": PROTOCOL_REVISION,
         "source_csv": None if source_csv is None else str(Path(source_csv).expanduser().resolve()),
         "logging_hz": float(logging_hz),
         "controller_family": str(controller_family),
@@ -735,9 +819,60 @@ def write_data_schema(
         "header_sha256": header_digest,
         "header": header,
         "groups": {name: {"size": len(columns), "columns": columns} for name, columns in groups.items()},
+        "column_origin": {
+            "simulation_generated": ordered(simulation_generated),
+            "policy_snapshot_generated_or_held": ordered(policy_snapshot),
+            "sonic_generated_with_unused_capacity_zero_padded": ordered(
+                policy_generated_or_zero_padded
+            ),
+            "explicitly_zeroed_for_non_sonic": ordered(explicitly_zeroed),
+            "source_passthrough": ordered(source_passthrough),
+            "source_passthrough_semantics": (
+                "copied from the nearest phase-matched source CSV row; these "
+                "columns are not recomputed from the replacement rollout"
+            ),
+        },
         "policy_columns": {
-            "mode": "sonic_native" if is_sonic else "legacy_sonic_fields_zero",
+            "mode": (
+                "sonic_native"
+                if is_sonic
+                else "sonic_supervision_zero_with_controller_neutral_received_state"
+            ),
             "high_rate_semantics": "latest 50 Hz policy snapshot held on 400 Hz state rows",
+            "policy_valid_semantics": (
+                "1 means SONIC token/action/reference supervision is valid; "
+                "0 does not invalidate policy_received_dof_pos"
+            ),
+            "field_validity": {
+                "policy_seq": {
+                    "valid_for": "all_controllers",
+                    "semantics": "source policy sequence associated with the held snapshot",
+                },
+                "policy_received_dof_pos": {
+                    "valid_for": "all_controllers",
+                    "held_at_logging_rate": True,
+                    "semantics": (
+                        "measured body29+left7+right7 position captured at the "
+                        "policy-inference boundary"
+                    ),
+                },
+                "token_state": {
+                    "valid_for": "sonic_only_when_policy_valid_is_1",
+                    "non_sonic_value": "zero",
+                },
+                "policy_last_action_in": {
+                    "valid_for": "sonic_only_when_policy_valid_is_1",
+                    "non_sonic_value": "zero",
+                },
+                "policy_raw_action_out": {
+                    "valid_for": "sonic_only_when_policy_valid_is_1",
+                    "non_sonic_value": "zero",
+                },
+                "reference_motion": {
+                    "valid_for": "sonic_only_when_policy_valid_is_1",
+                    "non_sonic_value": "zero",
+                },
+            },
         },
     }
     if extra:
@@ -756,9 +891,18 @@ def write_run_manifest(
     root_assist: str,
     rates_hz: Mapping[str, float],
     model_paths: Mapping[str, Path] | None = None,
+    provenance_extra: Mapping[str, Any] | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Write a reproducibility manifest, including model hashes."""
+    """Write a reproducibility manifest, including model hashes.
+
+    ``provenance_extra`` is a controller-neutral extension point for runtime,
+    git, staged-scene, asset, and compiled-model provenance assembled by the
+    runner.  It is intentionally separate from ``extra``, which retains the
+    existing free-form experiment metadata contract.  Omitting the new
+    argument preserves the revision-1 call signature and payload content apart
+    from the explicit protocol revision/provenance section.
+    """
 
     if root_assist not in {"none", "xy"}:
         raise ValueError("root_assist must be 'none' or 'xy'")
@@ -780,6 +924,7 @@ def write_run_manifest(
         }
     payload: dict[str, Any] = {
         "format_version": FORMAT_VERSION,
+        "protocol_revision": PROTOCOL_REVISION,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "controller_name": str(controller_name),
         "controller_family": str(controller_family),
@@ -788,6 +933,7 @@ def write_run_manifest(
         "root_assist": root_assist,
         "rates_hz": normalized_rates,
         "models": models,
+        "provenance": dict(provenance_extra or {}),
         "outputs": {
             "data_csv": "source-schema-compatible 400 Hz physical trajectory",
             "policy_telemetry_npz": "controller-native policy-rate telemetry",
@@ -806,6 +952,7 @@ __all__ = [
     "ControllerTelemetryWriter",
     "DEFAULT_LOGGING_HZ",
     "FORMAT_VERSION",
+    "PROTOCOL_REVISION",
     "PolicySnapshot",
     "ReplayCsvWriter",
     "TelemetryRecord",

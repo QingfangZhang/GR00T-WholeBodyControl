@@ -99,7 +99,13 @@ class TimelineTest(unittest.TestCase):
         )
         timeline = CsvTimeline.from_source_history(path, context)
         actual_qpos, actual_qvel = timeline.state()
-        np.testing.assert_array_equal(actual_qpos, qpos)
+        np.testing.assert_array_equal(actual_qpos[:3], qpos[:3])
+        np.testing.assert_array_equal(actual_qpos[7:], qpos[7:])
+        # Quaternion state is intentionally replaced by the exact timeline
+        # SLERP at t=1 ms, rather than retaining an inconsistent legacy value.
+        np.testing.assert_allclose(
+            actual_qpos[3:7], _yaw_quaternion(10.0), rtol=0.0, atol=1.0e-12
+        )
         np.testing.assert_array_equal(actual_qvel, qvel)
         self.assertAlmostEqual(timeline.current_time_s, 0.001)
         self.assertTrue(timeline.advance())
@@ -119,6 +125,69 @@ class TimelineTest(unittest.TestCase):
         expected = _yaw_quaternion(30.0)
         # q and -q encode the same orientation.
         self.assertAlmostEqual(abs(float(np.dot(qpos[3:7], expected))), 1.0, places=12)
+
+    def test_every_model_quaternion_uses_slerp_and_prefill_is_corrected(self) -> None:
+        path = self.directory / "data.csv"
+        header = ["control_time_s", "policy_seq"]
+        header.extend(f"component_{index}[qpos{index}]" for index in range(12))
+        header.extend(f"velocity_{index}[qvel{index}]" for index in range(3))
+        root0 = _yaw_quaternion(0.0)
+        root1 = -_yaw_quaternion(20.0)
+        object0 = _yaw_quaternion(30.0)
+        object1 = -_yaw_quaternion(70.0)
+        with path.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(header)
+            writer.writerow(
+                [0.0, 10, 0.0, 0.0, 1.0, *root0, 2.0, *object0, 0.0, 0.0, 0.0]
+            )
+            writer.writerow(
+                [
+                    0.0025,
+                    10,
+                    0.1,
+                    0.0,
+                    1.0,
+                    *root1,
+                    2.0,
+                    *object1,
+                    0.0,
+                    0.0,
+                    0.0,
+                ]
+            )
+        # Mimic the old source-history matcher: the task-object quaternion was
+        # linearly interpolated and therefore is not unit length.
+        initial = np.asarray(
+            [
+                0.05,
+                0.0,
+                1.0,
+                *_yaw_quaternion(10.0),
+                2.0,
+                *((object0 + object1) * 0.5),
+            ],
+            dtype=np.float64,
+        )
+        context = SimpleNamespace(
+            timeline_start_control_time_s=0.00125,
+            timeline_start_row_index=1,
+            initial_qpos=initial,
+            initial_qvel=np.zeros(3, dtype=np.float64),
+        )
+        timeline = CsvTimeline.from_source_history(
+            path,
+            context,
+            quaternion_qpos_slices=((3, 7), (8, 12)),
+        )
+        qpos, _ = timeline.state()
+        self.assertAlmostEqual(
+            abs(float(np.dot(qpos[3:7], _yaw_quaternion(10.0)))), 1.0, places=12
+        )
+        self.assertAlmostEqual(
+            abs(float(np.dot(qpos[8:12], _yaw_quaternion(50.0)))), 1.0, places=12
+        )
+        self.assertAlmostEqual(float(np.linalg.norm(qpos[8:12])), 1.0, places=12)
 
     def test_state_returns_copies_and_override_is_shape_checked(self) -> None:
         path = self._write_csv([0.0, 0.0025])

@@ -168,7 +168,7 @@ class ReplayCsvWriterTest(unittest.TestCase):
                 )
             writer.abort()
 
-    def test_non_sonic_clears_every_legacy_policy_vector(self) -> None:
+    def test_non_sonic_keeps_received_state_but_clears_sonic_vectors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "source.csv"
@@ -183,29 +183,71 @@ class ReplayCsvWriterTest(unittest.TestCase):
                     qpos=[1, 2],
                     qvel=[3, 4],
                     # Even an accidental generic override cannot leak into a
-                    # non-SONIC legacy policy field.
+                    # policy field: the held inference snapshot wins.
                     command_fields={"policy_received_dof_pos": [8, 8, 8]},
-                    policy_snapshot=PolicySnapshot(policy_seq=12),
-                    clear_reference_motion=True,
+                    policy_snapshot=PolicySnapshot(
+                        policy_seq=12,
+                        token=[91, 92],
+                        last_action=[93, 94],
+                        raw_action=[95, 96],
+                        received_dof_pos=[7, 8, 9],
+                    ),
+                    # This accidental SONIC reference is ignored for a
+                    # non-SONIC controller without relying on the caller to
+                    # request explicit clearing.
+                    reference_motion=[1234],
+                )
+                # A second high-rate row has no new inference and must retain
+                # the same measured state, even if a generic command tries to
+                # replace it.
+                writer.write_frame(
+                    source_row_index=1,
+                    sample_index=1,
+                    control_time_s=0.0025,
+                    mujoco_time_s=0.0025,
+                    qpos=[1.1, 2.1],
+                    qvel=[3.1, 4.1],
+                    command_fields={"policy_received_dof_pos": [-1, -1, -1]},
                 )
             header, rows = _read_csv(output)
             lookup = {name: index for index, name in enumerate(header)}
-            row = rows[0]
-            self.assertEqual(row[lookup["policy_valid"]], "0")
-            self.assertEqual(row[lookup["policy_token_size"]], "0")
-            self.assertEqual(row[lookup["policy_seq"]], "12")
-            self.assertEqual(row[lookup["policy_reference_motion_size"]], "0")
-            self.assertEqual(float(row[lookup["reference_motion[0]"]]), 0.0)
+            self.assertEqual(len(rows), 2)
+            for row in rows:
+                self.assertEqual(row[lookup["policy_valid"]], "0")
+                self.assertEqual(row[lookup["policy_token_size"]], "0")
+                self.assertEqual(row[lookup["policy_seq"]], "12")
+                self.assertEqual(row[lookup["policy_reference_motion_size"]], "0")
+                self.assertEqual(float(row[lookup["reference_motion[0]"]]), 0.0)
+                self.assertEqual(
+                    [
+                        float(row[lookup[f"policy_received_dof_pos[{index}]"]])
+                        for index in range(3)
+                    ],
+                    [7.0, 8.0, 9.0],
+                )
             for prefix, size in (
                 ("token_state", 4),
                 ("policy_last_action_in", 2),
                 ("policy_raw_action_out", 2),
-                ("policy_received_dof_pos", 3),
             ):
                 self.assertEqual(
-                    [float(row[lookup[f"{prefix}[{index}]"]]) for index in range(size)],
-                    [0.0] * size,
+                    [
+                        float(row[lookup[f"{prefix}[{index}]"]])
+                        for row in rows
+                        for index in range(size)
+                    ],
+                    [0.0] * (size * len(rows)),
                 )
+
+    def test_non_sonic_requires_controller_neutral_received_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.csv"
+            _write_source(source)
+            writer = ReplayCsvWriter(root / "result.csv", source, controller_family="teleopit")
+            with self.assertRaisesRegex(ValueError, "controller-neutral received_dof_pos"):
+                writer.set_policy_snapshot(PolicySnapshot(policy_seq=12))
+            writer.abort()
 
 
 class TelemetryWriterTest(unittest.TestCase):
@@ -288,6 +330,7 @@ class JsonHelperTest(unittest.TestCase):
                 header=_header(),
                 controller_family="sonic_regular",
                 source_csv=source,
+                generated_command_fields=("joint_target",),
             )
             manifest = write_run_manifest(
                 root / "run_manifest.json",
@@ -298,14 +341,58 @@ class JsonHelperTest(unittest.TestCase):
                 root_assist="xy",
                 rates_hz={"physics": 2000, "pd": 200, "policy": 50, "logging": 400},
                 model_paths={"encoder": model},
+                provenance_extra={
+                    "git": {"commit": "abc123", "dirty": True},
+                    "runtime": {"onnxruntime": "test-version"},
+                    "compiled_model_sha256": "deadbeef",
+                },
             )
             self.assertEqual(schema["header"], _header())
+            self.assertEqual(schema["protocol_revision"], 2)
             self.assertEqual(schema["policy_columns"]["mode"], "sonic_native")
             self.assertEqual(schema["groups"]["token_state"]["size"], 4)
+            self.assertEqual(schema["groups"]["reference_motion"]["size"], 1)
+            self.assertIn(
+                "joint_target[0]",
+                schema["column_origin"]["simulation_generated"],
+            )
+            self.assertIn(
+                "gripper_close",
+                schema["column_origin"]["source_passthrough"],
+            )
+            self.assertEqual(
+                schema["policy_columns"]["field_validity"]["policy_received_dof_pos"][
+                    "valid_for"
+                ],
+                "all_controllers",
+            )
             self.assertEqual(manifest["models"]["encoder"]["sha256"], sha256_file(model))
             self.assertEqual(manifest["root_assist"], "xy")
+            self.assertEqual(manifest["protocol_revision"], 2)
+            self.assertEqual(manifest["provenance"]["git"]["commit"], "abc123")
+            self.assertEqual(
+                manifest["provenance"]["runtime"]["onnxruntime"], "test-version"
+            )
             with (root / "data_schema.json").open(encoding="utf-8") as source_json:
                 self.assertEqual(json.load(source_json)["column_count"], len(_header()))
+
+    def test_non_sonic_schema_marks_only_received_state_controller_neutral(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schema = write_data_schema(
+                root / "data_schema.json",
+                header=_header(),
+                controller_family="teleopit",
+            )
+            policy = schema["policy_columns"]
+            self.assertEqual(
+                policy["mode"],
+                "sonic_supervision_zero_with_controller_neutral_received_state",
+            )
+            validity = policy["field_validity"]
+            self.assertEqual(validity["policy_received_dof_pos"]["valid_for"], "all_controllers")
+            for name in ("token_state", "policy_last_action_in", "policy_raw_action_out"):
+                self.assertEqual(validity[name]["non_sonic_value"], "zero")
 
 
 if __name__ == "__main__":

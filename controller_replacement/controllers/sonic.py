@@ -143,7 +143,13 @@ KDS_MUJOCO = np.asarray(
 # exact native command values while avoiding mixed-dtype arithmetic later.
 KPS_MUJOCO = KPS_MUJOCO.astype(np.float32).astype(np.float64)
 KDS_MUJOCO = KDS_MUJOCO.astype(np.float32).astype(np.float64)
-TORQUE_LIMITS_MUJOCO = np.asarray(
+# These are the effort-limit numerators used by the released C++ action-scale
+# formula.  They are *not* a controller-side applied-torque limit.  In
+# particular, the official ankle and waist actuators use 50 Nm effort limits
+# together with doubled stiffness, which is algebraically equivalent to using
+# 25 here with the base stiffness.  Applied SONIC torques are limited by the
+# staged robot model's actuator ranges in the simulator.
+_ACTION_SCALE_EFFORT_NUMERATOR_MUJOCO = np.asarray(
     [
         139.0, 139.0, 88.0, 139.0, 25.0, 25.0,
         139.0, 139.0, 88.0, 139.0, 25.0, 25.0,
@@ -153,7 +159,7 @@ TORQUE_LIMITS_MUJOCO = np.asarray(
     ],
     dtype=np.float64,
 )
-ACTION_SCALE_MUJOCO = 0.25 * TORQUE_LIMITS_MUJOCO / np.asarray(
+ACTION_SCALE_MUJOCO = 0.25 * _ACTION_SCALE_EFFORT_NUMERATOR_MUJOCO / np.asarray(
     [
         _KP_7520_22, _KP_7520_22, _KP_7520_14, _KP_7520_22,
         _KP_5020, _KP_5020,
@@ -245,6 +251,13 @@ class _Session(Protocol):
     def get_inputs(self) -> Sequence[_ValueInfo]: ...
     def get_outputs(self) -> Sequence[_ValueInfo]: ...
     def run(self, output_names: Sequence[str] | None, inputs: Mapping[str, Any]) -> list[Any]: ...
+
+
+def _session_providers(session: Any) -> list[str]:
+    getter = getattr(session, "get_providers", None)
+    if not callable(getter):
+        return ["injected_session_provider_unknown"]
+    return [str(value) for value in getter()]
 
 
 def _shape_tuple(value: Sequence[Any]) -> tuple[int | str | None, ...]:
@@ -430,7 +443,7 @@ class SonicInference:
     q_target_isaaclab: FloatArray
     kp: FloatArray
     kd: FloatArray
-    torque_limit: FloatArray
+    torque_limit: FloatArray | None
     received_dof_pos: FloatArray
 
     @property
@@ -497,6 +510,9 @@ class SonicController:
         )
         self.require_source_history = bool(require_source_history)
         self.validate_prefill_current_state = bool(validate_prefill_current_state)
+        self.requested_device = str(device).strip().lower()
+        encoder_sha256_before = _sha256(self.spec.encoder_path)
+        decoder_sha256_before = _sha256(self.spec.decoder_path)
         self.encoder_session = (
             _make_ort_session(self.spec.encoder_path, device)
             if encoder_session is None
@@ -507,6 +523,20 @@ class SonicController:
             if decoder_session is None
             else decoder_session
         )
+        encoder_sha256_after = _sha256(self.spec.encoder_path)
+        decoder_sha256_after = _sha256(self.spec.decoder_path)
+        if encoder_sha256_after != encoder_sha256_before:
+            raise SonicControllerError(
+                "encoder ONNX changed while its inference session was created"
+            )
+        if decoder_sha256_after != decoder_sha256_before:
+            raise SonicControllerError(
+                "decoder ONNX changed while its inference session was created"
+            )
+        self.loaded_model_sha256 = {
+            "encoder": encoder_sha256_before,
+            "decoder": decoder_sha256_before,
+        }
         self.encoder_input_name, self.encoder_output_name = _validate_session(
             self.encoder_session,
             path=self.spec.encoder_path,
@@ -539,8 +569,15 @@ class SonicController:
         return KDS_MUJOCO.copy()
 
     @property
-    def torque_limit(self) -> FloatArray:
-        return TORQUE_LIMITS_MUJOCO.copy()
+    def torque_limit(self) -> None:
+        """SONIC publishes no controller-side applied-torque limit.
+
+        The released deployment sends joint targets, gains, zero desired
+        velocity, and zero feed-forward torque.  The staged robot model owns
+        the physical actuator limits.
+        """
+
+        return None
 
     @property
     def inference_count(self) -> int:
@@ -560,19 +597,34 @@ class SonicController:
             "reference_view": self.spec.reference_view,
             "orientation_mode": self.spec.orientation_mode,
             "heading_reinitialisation": False,
+            "inference_runtime": {
+                "backend": "onnxruntime",
+                "requested_device": self.requested_device,
+                "encoder_actual_providers": _session_providers(
+                    self.encoder_session
+                ),
+                "decoder_actual_providers": _session_providers(
+                    self.decoder_session
+                ),
+            },
             "encoder": {
                 "path": str(self.spec.encoder_path),
-                "sha256": _sha256(self.spec.encoder_path),
+                "sha256": self.loaded_model_sha256["encoder"],
                 "input_dimension": self.spec.encoder_input_dim,
                 "output_dimension": TOKEN_DIM,
             },
             "decoder": {
                 "path": str(self.spec.decoder_path),
-                "sha256": _sha256(self.spec.decoder_path),
+                "sha256": self.loaded_model_sha256["decoder"],
                 "input_dimension": DECODER_INPUT_DIM,
                 "output_dimension": NUM_JOINTS,
             },
             "source_history_required": self.require_source_history,
+            "pd": {
+                "gains": "released SONIC Kp/Kd",
+                "controller_torque_limit": None,
+                "applied_torque_limit": "staged MuJoCo actuator ctrlrange",
+            },
         }
 
     def reset(
@@ -669,7 +721,9 @@ class SonicController:
         dq_mujoco = _finite_vector(state.joint_vel, 29, "robot joint_vel")
         root_quat = _unit_quaternion(state.root_quat_wxyz, "robot root quaternion")
         root_ang_vel = _finite_vector(
-            state.root_ang_vel_b, 3, "robot root angular velocity"
+            state.sonic_base_ang_vel_qvel,
+            3,
+            "SONIC free-joint base angular velocity",
         )
         return q_mujoco, dq_mujoco, root_quat, root_ang_vel
 
@@ -883,7 +937,7 @@ class SonicController:
             q_target_isaaclab=q_target[MUJOCO_INDEX_FOR_ISAACLAB].copy(),
             kp=KPS_MUJOCO.copy(),
             kd=KDS_MUJOCO.copy(),
-            torque_limit=TORQUE_LIMITS_MUJOCO.copy(),
+            torque_limit=self.torque_limit,
             received_dof_pos=received_dof_pos.astype(np.float32, copy=True),
         )
 
@@ -905,7 +959,6 @@ __all__ = [
     "SonicModelSpec",
     "SonicVariant",
     "TOKEN_DIM",
-    "TORQUE_LIMITS_MUJOCO",
     "action_to_q_target",
     "default_model_spec",
 ]

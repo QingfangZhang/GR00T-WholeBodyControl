@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -43,6 +44,7 @@ from .references import (
 
 
 SOURCE_HISTORY_PRIOR_FRAMES = 9
+DEFAULT_RAW_POLICY_GROUP_OFFSET = 11
 
 
 class SourceHistoryContextError(ValueError):
@@ -56,6 +58,14 @@ def _resolve_csv(recording: str | Path) -> Path:
     if not value.is_file():
         raise SourceHistoryContextError(f"data.csv not found: {value}")
     return value
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -150,6 +160,57 @@ def resolve_raw_policy_group_offset(
     return candidate
 
 
+def load_reference_from_raw_policy_group(
+    recording: str | Path,
+    *,
+    mode: ReferenceMode | str,
+    raw_policy_group_offset: int = DEFAULT_RAW_POLICY_GROUP_OFFSET,
+    policy_count: int | None = None,
+) -> ReferenceSequence:
+    """Load a reference beginning at one zero-based raw CSV policy group.
+
+    Raw ``policy_seq`` groups are the public takeover coordinate.  Reference
+    providers may remove a truncated first/last group, so their processed
+    array index is deliberately resolved from the selected raw group's exact
+    ``policy_seq`` instead of being treated as the same number.
+    """
+
+    if isinstance(raw_policy_group_offset, bool) or not isinstance(
+        raw_policy_group_offset, (int, np.integer)
+    ):
+        raise SourceHistoryContextError(
+            "raw_policy_group_offset must be an integer"
+        )
+    raw_offset = int(raw_policy_group_offset)
+    if raw_offset < 0:
+        raise SourceHistoryContextError(
+            "raw_policy_group_offset must be non-negative"
+        )
+    groups = _read_raw_policy_groups(_resolve_csv(recording))
+    if raw_offset >= len(groups):
+        raise SourceHistoryContextError(
+            f"raw_policy_group_offset {raw_offset} is outside [0, "
+            f"{len(groups) - 1}]"
+        )
+    selected_policy_seq = groups[raw_offset].policy_seq
+
+    reference = load_reference(recording, mode=mode, policy_offset=0)
+    matches = np.flatnonzero(
+        np.asarray(reference.policy_seq, dtype=np.int64) == selected_policy_seq
+    )
+    if matches.size != 1:
+        raise SourceHistoryContextError(
+            f"raw policy group {raw_offset} (policy_seq {selected_policy_seq}) "
+            "is not present exactly once in the edge-trimmed reference"
+        )
+    selected = reference.slice(int(matches[0]), policy_count)
+    if int(selected.policy_seq[0]) != selected_policy_seq:
+        raise SourceHistoryContextError(
+            "reference selection changed the requested raw policy group"
+        )
+    return selected
+
+
 def _readonly_vector(value: Any, *, name: str) -> np.ndarray:
     result = np.asarray(value, dtype=np.float64).reshape(-1).copy()
     if result.size == 0 or not np.all(np.isfinite(result)):
@@ -227,6 +288,12 @@ class SourceHistoryContext:
         if not isinstance(self.sonic_prefill_payload, Mapping):
             raise SourceHistoryContextError("sonic_prefill_payload must be a mapping")
         payload = self.sonic_prefill_payload
+        payload_source_sha256 = str(payload.get("source_csv_sha256", ""))
+        actual_source_sha256 = _sha256_file(source)
+        if payload_source_sha256 != actual_source_sha256:
+            raise SourceHistoryContextError(
+                "source-history payload SHA-256 does not match source data.csv"
+            )
         if payload.get("format") != "g1_decoder_source_history_prefill" or int(
             payload.get("version", -1)
         ) != 1:
@@ -262,7 +329,10 @@ class SourceHistoryContext:
         return {
             "mode": "source_history_prefill",
             "formal_experiment_condition": True,
-            "selection_semantics": "exact selected ReferenceSequence first policy_seq",
+            "selection_semantics": (
+                "zero-based raw CSV policy_seq-group offset; exact policy_seq "
+                "is used to resolve the edge-trimmed reference index"
+            ),
             "source_csv": str(self.source_csv_path),
             "source_csv_sha256": payload.get("source_csv_sha256"),
             "reference_mode": self.reference_mode.value,
@@ -270,6 +340,8 @@ class SourceHistoryContext:
             "selected_reference_source_row_index": (
                 self.selected_reference_source_row_index
             ),
+            "raw_policy_group_offset": self.raw_policy_group_offset,
+            # Retained for readers of controller_replacement format v1.
             "resolved_raw_policy_group_offset": self.raw_policy_group_offset,
             "raw_first_policy_seq": self.raw_first_policy_seq,
             "raw_last_policy_seq": self.raw_last_policy_seq,
@@ -395,9 +467,11 @@ def build_source_history_context(
     # Record both coordinate systems in the payload forwarded to SONIC and in
     # the separately written context metadata.
     payload["controller_replacement_selection"] = {
-        "selection_mode": "exact_reference_policy_seq",
+        "selection_mode": "raw_policy_group_offset_via_exact_policy_seq",
         "selected_policy_seq": selected_policy_seq,
         "selected_reference_source_row_index": selected_source_row,
+        "raw_policy_group_offset": raw_offset,
+        # Retained for readers of controller_replacement format v1.
         "resolved_raw_policy_group_offset": raw_offset,
         "raw_first_policy_seq": groups[0].policy_seq,
         "raw_last_policy_seq": groups[-1].policy_seq,
@@ -529,10 +603,12 @@ def write_source_history_artifacts(
 
 
 __all__ = [
+    "DEFAULT_RAW_POLICY_GROUP_OFFSET",
     "SOURCE_HISTORY_PRIOR_FRAMES",
     "SourceHistoryContext",
     "SourceHistoryContextError",
     "build_source_history_context",
+    "load_reference_from_raw_policy_group",
     "resolve_raw_policy_group_offset",
     "write_source_history_artifacts",
 ]

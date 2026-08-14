@@ -35,7 +35,7 @@ def _normalise_quaternion_wxyz(value: np.ndarray) -> np.ndarray:
     quaternion = np.asarray(value, dtype=np.float64)
     norm = float(np.linalg.norm(quaternion))
     if not np.isfinite(norm) or norm <= 1.0e-12:
-        raise TimelineError("root quaternion is zero or non-finite")
+        raise TimelineError("quaternion is zero or non-finite")
     return quaternion / norm
 
 
@@ -84,6 +84,7 @@ class CsvTimeline:
         start_time_s: float,
         start_row_index: int | None = None,
         log_hz: int = SOURCE_HZ,
+        quaternion_qpos_slices: Sequence[tuple[int, int]] | None = None,
     ) -> None:
         if isinstance(log_hz, bool) or int(log_hz) != SOURCE_HZ:
             raise TimelineError(
@@ -104,6 +105,34 @@ class CsvTimeline:
             self._qvel,
             self._policy_seq,
         ) = self._load(self.csv_path)
+        raw_quaternion_slices = (
+            ((3, 7),)
+            if quaternion_qpos_slices is None
+            else tuple(quaternion_qpos_slices)
+        )
+        normalized_slices: list[tuple[int, int]] = []
+        for raw_start, raw_stop in raw_quaternion_slices:
+            start = int(raw_start)
+            stop = int(raw_stop)
+            if stop - start != 4 or start < 0 or stop > self._qpos.shape[1]:
+                raise TimelineError(
+                    "quaternion qpos slices must be non-overlapping four-value "
+                    f"ranges inside qpos; got {(start, stop)}"
+                )
+            if any(start < previous_stop and previous_start < stop for (
+                previous_start, previous_stop
+            ) in normalized_slices):
+                raise TimelineError("quaternion qpos slices overlap")
+            normalized_slices.append((start, stop))
+        if not normalized_slices:
+            raise TimelineError("at least one quaternion qpos slice is required")
+        self.quaternion_qpos_slices = tuple(sorted(normalized_slices))
+        for start, stop in self.quaternion_qpos_slices:
+            norms = np.linalg.norm(self._qpos[:, start:stop], axis=1)
+            if np.any(~np.isfinite(norms)) or np.any(norms <= 1.0e-12):
+                raise TimelineError(
+                    f"source contains a zero or non-finite quaternion at qpos[{start}:{stop}]"
+                )
         self._validate_source_clock(self._times)
 
         self._start_time_s = float(start_time_s)
@@ -155,7 +184,11 @@ class CsvTimeline:
 
     @classmethod
     def from_source_history(
-        cls, csv_path: str | Path, context: Any
+        cls,
+        csv_path: str | Path,
+        context: Any,
+        *,
+        quaternion_qpos_slices: Sequence[tuple[int, int]] | None = None,
     ) -> "CsvTimeline":
         """Build and initialize from a ``SourceHistoryContext``-like object."""
 
@@ -174,8 +207,17 @@ class CsvTimeline:
             csv_path,
             start_time_s=float(context.timeline_start_control_time_s),
             start_row_index=int(context.timeline_start_row_index),
+            quaternion_qpos_slices=quaternion_qpos_slices,
         )
-        timeline.override_initial_state(context.initial_qpos, context.initial_qvel)
+        # The legacy source-history matcher already SLERPs the robot root, but
+        # linearly interpolates task-object free/ball quaternions.  Preserve all
+        # of its joint/qvel values while replacing every quaternion with the
+        # exact phase-matched SLERP used by this formal timeline.
+        initial_qpos = np.asarray(context.initial_qpos, dtype=np.float64).copy()
+        sampled_qpos, _ = timeline._sample(timeline.current_time_s)
+        for start, stop in timeline.quaternion_qpos_slices:
+            initial_qpos[start:stop] = sampled_qpos[start:stop]
+        timeline.override_initial_state(initial_qpos, context.initial_qvel)
         return timeline
 
     @staticmethod
@@ -255,10 +297,6 @@ class CsvTimeline:
             and np.all(np.isfinite(qvel_array))
         ):
             raise TimelineError("source control_time_s/qpos/qvel contains non-finite values")
-        # Validate every source quaternion early instead of failing mid-rollout.
-        quaternion_norms = np.linalg.norm(qpos_array[:, 3:7], axis=1)
-        if np.any(~np.isfinite(quaternion_norms)) or np.any(quaternion_norms <= 1.0e-12):
-            raise TimelineError("source contains a zero or non-finite root quaternion")
         policy_array = (
             np.asarray(policy_seq, dtype=np.int64) if policy_seq is not None else None
         )
@@ -319,12 +357,19 @@ class CsvTimeline:
     def _sample(self, sample_time_s: float) -> tuple[np.ndarray, np.ndarray]:
         right = int(np.searchsorted(self._times, sample_time_s, side="left"))
         if right <= 0:
-            return self._qpos[0].copy(), self._qvel[0].copy()
+            qpos = self._qpos[0].copy()
+            for start, stop in self.quaternion_qpos_slices:
+                qpos[start:stop] = _normalise_quaternion_wxyz(qpos[start:stop])
+            return qpos, self._qvel[0].copy()
         if right >= len(self._times):
-            return self._qpos[-1].copy(), self._qvel[-1].copy()
+            qpos = self._qpos[-1].copy()
+            for start, stop in self.quaternion_qpos_slices:
+                qpos[start:stop] = _normalise_quaternion_wxyz(qpos[start:stop])
+            return qpos, self._qvel[-1].copy()
         if abs(float(self._times[right] - sample_time_s)) <= 1.0e-12:
             qpos = self._qpos[right].copy()
-            qpos[3:7] = _normalise_quaternion_wxyz(qpos[3:7])
+            for start, stop in self.quaternion_qpos_slices:
+                qpos[start:stop] = _normalise_quaternion_wxyz(qpos[start:stop])
             return qpos, self._qvel[right].copy()
         left = right - 1
         width = float(self._times[right] - self._times[left])
@@ -332,9 +377,12 @@ class CsvTimeline:
         qpos = self._qpos[left] + fraction * (self._qpos[right] - self._qpos[left])
         qvel = self._qvel[left] + fraction * (self._qvel[right] - self._qvel[left])
         qpos = np.asarray(qpos, dtype=np.float64)
-        qpos[3:7] = _slerp_wxyz(
-            self._qpos[left, 3:7], self._qpos[right, 3:7], fraction
-        )
+        for start, stop in self.quaternion_qpos_slices:
+            qpos[start:stop] = _slerp_wxyz(
+                self._qpos[left, start:stop],
+                self._qpos[right, start:stop],
+                fraction,
+            )
         return qpos, np.asarray(qvel, dtype=np.float64)
 
     @property
@@ -342,6 +390,12 @@ class CsvTimeline:
         """Exact source-clock time of the current 400 Hz sample."""
 
         return self._start_time_s + self._position * self.dt_s
+
+    @property
+    def qpos_width(self) -> int:
+        """Number of MuJoCo qpos values in each source state."""
+
+        return int(self._qpos.shape[1])
 
     @property
     def exhausted(self) -> bool:
@@ -378,10 +432,15 @@ class CsvTimeline:
             )
         if not np.all(np.isfinite(qpos_array)) or not np.all(np.isfinite(qvel_array)):
             raise TimelineError("initial state override contains non-finite values")
-        # Keep the exact phase-match quaternion, but reject invalid state rather
-        # than silently normalising data that the matcher promised was exact.
-        if float(np.linalg.norm(qpos_array[3:7])) <= 1.0e-12:
-            raise TimelineError("initial state override has a zero root quaternion")
+        # ``from_source_history`` has already replaced every task-object
+        # quaternion with the exact timeline SLERP.  Reject invalid direct
+        # overrides rather than silently normalising them here.
+        for start, stop in self.quaternion_qpos_slices:
+            if float(np.linalg.norm(qpos_array[start:stop])) <= 1.0e-12:
+                raise TimelineError(
+                    "initial state override has a zero quaternion at "
+                    f"qpos[{start}:{stop}]"
+                )
         self._initial_override = (qpos_array.copy(), qvel_array.copy())
 
     def advance(self) -> bool:

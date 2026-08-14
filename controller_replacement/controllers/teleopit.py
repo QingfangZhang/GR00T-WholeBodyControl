@@ -27,6 +27,7 @@ import hashlib
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
+import mujoco
 import numpy as np
 
 from Teleopit_rollout.constants import (
@@ -52,6 +53,7 @@ from Teleopit_rollout.teleopit_policy import (
 FloatArray = np.ndarray
 SOURCE_HISTORY_PRIOR_FRAMES = HISTORY_LENGTH - 1
 SOURCE_ACTION_CLIP = (-10.0, 10.0)
+RECEIVED_DOF_DIM = 43
 
 # ``change_ckpt/source_history_prefill.py`` calls this mapping
 # ``MUJOCO_TO_ISAACLAB``.  More explicitly, element ``j`` is the MuJoCo joint
@@ -99,7 +101,8 @@ class TeleopitStateLike(Protocol):
     joint_vel: FloatArray
     root_pos: FloatArray
     root_quat_wxyz: FloatArray
-    root_ang_vel_b: FloatArray
+    teleopit_pelvis_ang_vel_b: FloatArray
+    received_dof_pos: FloatArray
     timestamp_s: float
 
 
@@ -350,7 +353,11 @@ class TeleopitSourceHistoryPrefill:
         }
 
 
-def _source_snapshot_state(snapshot: Mapping[str, Any], policy_seq: int) -> RobotState:
+def _source_snapshot_state(
+    snapshot: Mapping[str, Any],
+    policy_seq: int,
+    observation_builder: TeleopitObservationBuilder,
+) -> RobotState:
     """Recover Teleopit-order measured state from a validated SONIC snapshot."""
 
     body_q_relative_isaaclab = _finite_vector(
@@ -366,6 +373,62 @@ def _source_snapshot_state(snapshot: Mapping[str, Any], policy_seq: int) -> Robo
     dq_mujoco = np.empty(ACTION_DIM, dtype=np.float32)
     q_mujoco[SONIC_MUJOCO_INDEX_FOR_ISAACLAB] = q_isaaclab
     dq_mujoco[SONIC_MUJOCO_INDEX_FOR_ISAACLAB] = body_dq_isaaclab
+    base_quat = _finite_vector(
+        snapshot.get("base_quat"), 4, "source_history.base_quat"
+    )
+    base_ang_vel_qvel = _finite_vector(
+        snapshot.get("base_ang_vel"), 3, "source_history.base_ang_vel"
+    )
+
+    # Reconstruct the same pelvis-local signal used by the live simulator.
+    # The source payload stores free-joint qvel[3:6]; the pinned Teleopit XML
+    # can include a small frame offset, so forwarding it as an already-native
+    # pelvis observation would mix startup and live observation contracts.
+    synthetic_projector = getattr(
+        observation_builder, "source_pelvis_ang_vel_b", None
+    )
+    if callable(synthetic_projector):
+        pelvis_ang_vel_b = _finite_vector(
+            synthetic_projector(
+                base_quat,
+                q_mujoco,
+                dq_mujoco,
+                base_ang_vel_qvel,
+            ),
+            3,
+            "source_history.projected_pelvis_ang_vel_b",
+        )
+    elif isinstance(observation_builder, TeleopitObservationBuilder):
+        model = observation_builder.model
+        data = observation_builder.data
+        data.qpos[:] = observation_builder._neutral_qpos
+        data.qvel[:] = 0.0
+        data.qpos[0:3] = 0.0
+        data.qpos[3:7] = base_quat.astype(np.float64)
+        data.qpos[observation_builder._joint_qpos_addresses] = q_mujoco
+        joint_dof_addresses = np.asarray(
+            [model.jnt_dofadr[model.joint(name).id] for name in G1_JOINT_NAMES],
+            dtype=np.int32,
+        )
+        data.qvel[3:6] = base_ang_vel_qvel.astype(np.float64)
+        data.qvel[joint_dof_addresses] = dq_mujoco.astype(np.float64)
+        mujoco.mj_forward(model, data)
+        pelvis_velocity_local = np.zeros(6, dtype=np.float64)
+        mujoco.mj_objectVelocity(
+            model,
+            data,
+            mujoco.mjtObj.mjOBJ_BODY,
+            model.body("pelvis").id,
+            pelvis_velocity_local,
+            1,
+        )
+        pelvis_ang_vel_b = np.asarray(
+            pelvis_velocity_local[0:3], dtype=np.float32
+        )
+    else:
+        raise TeleopitAdapterError(
+            "custom observation builder must implement source_pelvis_ang_vel_b"
+        )
     return RobotState(
         joint_pos=q_mujoco,
         joint_vel=dq_mujoco,
@@ -374,12 +437,8 @@ def _source_snapshot_state(snapshot: Mapping[str, Any], policy_seq: int) -> Robo
         # SONIC prefill payload intentionally omits root xyz, so use an explicit
         # zero with this invariant documented rather than borrowing reference xy.
         root_pos=np.zeros(3, dtype=np.float32),
-        root_quat_wxyz=_finite_vector(
-            snapshot.get("base_quat"), 4, "source_history.base_quat"
-        ),
-        root_ang_vel_b=_finite_vector(
-            snapshot.get("base_ang_vel"), 3, "source_history.base_ang_vel"
-        ),
+        root_quat_wxyz=base_quat,
+        root_ang_vel_b=pelvis_ang_vel_b,
         timestamp_s=float(policy_seq) / 50.0,
     )
 
@@ -478,7 +537,9 @@ def build_sonic_source_history_prefill(
             snapshot.get("last_action"), strict=strict_action_conversion
         )
         observation = observation_builder.build(
-            _source_snapshot_state(snapshot, int(sequence)),
+            _source_snapshot_state(
+                snapshot, int(sequence), observation_builder
+            ),
             features,
             conversion.teleopit_raw_action,
         )
@@ -502,7 +563,76 @@ def build_sonic_source_history_prefill(
 
 
 class _SourcePrefillableTeleopitPolicy(TeleopitOnnxPolicy):
-    """Expose a checked initializer for the audited policy's history deque."""
+    """Pinned Teleopit policy with deterministic ORT and checked prefill.
+
+    The upstream adapter intentionally leaves ORT threading at its defaults.
+    Formal controller-replacement runs instead use the same sequential,
+    single-thread session contract as the SONIC adapters.  Reimplementing only
+    the small session constructor here keeps the pinned Teleopit source
+    untouched while making the runtime condition explicit and auditable.
+    """
+
+    def __init__(self, checkpoint: str | Path, device: str = "cpu") -> None:
+        path = Path(checkpoint).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Teleopit checkpoint not found: {path}")
+        try:
+            import onnxruntime as ort
+        except ModuleNotFoundError as exc:
+            raise ImportError(
+                "onnxruntime is required; run Teleopit_rollout/setup_env.sh"
+            ) from exc
+
+        options = ort.SessionOptions()
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        normalized = str(device).strip().lower()
+        available = set(ort.get_available_providers())
+        if normalized == "cpu":
+            providers = ["CPUExecutionProvider"]
+        elif normalized == "cuda":
+            if "CUDAExecutionProvider" not in available:
+                raise TeleopitAdapterError(
+                    "CUDAExecutionProvider was requested but is not available"
+                )
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        else:
+            raise ValueError("device must be 'cpu' or 'cuda'")
+
+        self.checkpoint = path
+        self.session = ort.InferenceSession(
+            str(path), sess_options=options, providers=providers
+        )
+        self.providers = tuple(self.session.get_providers())
+        inputs = self.session.get_inputs()
+        outputs = self.session.get_outputs()
+        input_signature = [(item.name, tuple(item.shape)) for item in inputs]
+        output_signature = [(item.name, tuple(item.shape)) for item in outputs]
+        expected_inputs = [
+            ("obs", (1, OBSERVATION_DIM)),
+            ("obs_history", (1, HISTORY_LENGTH, OBSERVATION_DIM)),
+        ]
+        expected_outputs = [("actions", (1, ACTION_DIM))]
+        if input_signature != expected_inputs:
+            raise ValueError(
+                f"unexpected Teleopit ONNX inputs {input_signature}; "
+                f"expected {expected_inputs}"
+            )
+        if output_signature != expected_outputs:
+            raise ValueError(
+                f"unexpected Teleopit ONNX outputs {output_signature}; "
+                f"expected {expected_outputs}"
+            )
+        self._history = deque(maxlen=HISTORY_LENGTH)
+        self.last_history = None
+        self.session_contract = {
+            "execution_mode": "ORT_SEQUENTIAL",
+            "intra_op_num_threads": 1,
+            "inter_op_num_threads": 1,
+            "graph_optimization_level": "ORT_ENABLE_ALL",
+        }
 
     def load_precurrent_history(self, observations: Any) -> None:
         history = np.asarray(observations, dtype=np.float32)
@@ -547,7 +677,7 @@ class TeleopitStep:
             ("kp", (ACTION_DIM,)),
             ("kd", (ACTION_DIM,)),
             ("torque_limit", (ACTION_DIM,)),
-            ("received_dof_pos", (ACTION_DIM,)),
+            ("received_dof_pos", (RECEIVED_DOF_DIM,)),
         ):
             object.__setattr__(self, name, _readonly(getattr(self, name), shape, name))
 
@@ -589,12 +719,31 @@ class TeleopitController:
     ) -> None:
         self.checkpoint = Path(checkpoint).expanduser().resolve()
         self.robot_xml = Path(robot_xml).expanduser().resolve()
+        self.requested_device = str(device).strip().lower()
         if prefill_validation_atol < 0.0 or not np.isfinite(prefill_validation_atol):
             raise ValueError("prefill_validation_atol must be finite and non-negative")
         self.prefill_validation_atol = float(prefill_validation_atol)
         self.require_source_history = bool(require_source_history)
+        checkpoint_sha256_before = _sha256(self.checkpoint)
+        robot_xml_sha256_before = _sha256(self.robot_xml)
         self.observation_builder = TeleopitObservationBuilder(self.robot_xml)
-        self.policy = _SourcePrefillableTeleopitPolicy(self.checkpoint, device=device)
+        self.policy = _SourcePrefillableTeleopitPolicy(
+            self.checkpoint, device=self.requested_device
+        )
+        checkpoint_sha256_after = _sha256(self.checkpoint)
+        robot_xml_sha256_after = _sha256(self.robot_xml)
+        if checkpoint_sha256_after != checkpoint_sha256_before:
+            raise TeleopitAdapterError(
+                "Teleopit checkpoint changed while its inference session was created"
+            )
+        if robot_xml_sha256_after != robot_xml_sha256_before:
+            raise TeleopitAdapterError(
+                "Teleopit FK robot XML changed while its model was loaded"
+            )
+        self.loaded_model_sha256 = {
+            "tracker": checkpoint_sha256_before,
+            "fk_robot_xml": robot_xml_sha256_before,
+        }
         self._previous_raw_action = np.zeros(ACTION_DIM, dtype=np.float32)
         self._previous_reference_qpos36: FloatArray | None = None
         self._expected_current_observation: FloatArray | None = None
@@ -674,7 +823,9 @@ class TeleopitController:
                 robot_state.root_quat_wxyz, 4, "root_quat_wxyz"
             ),
             root_ang_vel_b=_finite_vector(
-                robot_state.root_ang_vel_b, 3, "root_ang_vel_b"
+                robot_state.teleopit_pelvis_ang_vel_b,
+                3,
+                "teleopit_pelvis_ang_vel_b",
             ),
             timestamp_s=float(robot_state.timestamp_s),
         )
@@ -724,7 +875,11 @@ class TeleopitController:
             kp=self.kp,
             kd=self.kd,
             torque_limit=self.torque_limit,
-            received_dof_pos=np.asarray(robot_state.joint_pos, dtype=np.float32),
+            received_dof_pos=_finite_vector(
+                robot_state.received_dof_pos,
+                RECEIVED_DOF_DIM,
+                "received_dof_pos",
+            ),
             prefill_validation_max_abs=validation_error,
         )
         self._previous_raw_action = np.asarray(raw_action, dtype=np.float32).copy()
@@ -757,9 +912,15 @@ class TeleopitController:
             "teleopit_version": TELEOPIT_VERSION,
             "teleopit_commit": TELEOPIT_COMMIT,
             "checkpoint": str(self.checkpoint),
-            "checkpoint_sha256": _sha256(self.checkpoint),
+            "checkpoint_sha256": self.loaded_model_sha256["tracker"],
             "fk_robot_xml": str(self.robot_xml),
-            "fk_robot_xml_sha256": _sha256(self.robot_xml),
+            "fk_robot_xml_sha256": self.loaded_model_sha256["fk_robot_xml"],
+            "inference_runtime": {
+                "backend": "onnxruntime",
+                "requested_device": self.requested_device,
+                "actual_providers": list(self.policy.providers),
+                "session_contract": dict(self.policy.session_contract),
+            },
             "observation_dim": OBSERVATION_DIM,
             "observation_history_length": HISTORY_LENGTH,
             "history_initialization": self.history_initialization,

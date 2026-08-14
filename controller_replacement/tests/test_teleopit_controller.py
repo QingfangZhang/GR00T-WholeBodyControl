@@ -30,6 +30,7 @@ from controller_replacement.controllers.teleopit import (  # noqa: E402
 from Teleopit_rollout.constants import (  # noqa: E402
     ACTION_SCALE,
     DEFAULT_DOF_POS,
+    G1_JOINT_NAMES,
     KDS,
     KPS,
     TORQUE_LIMITS,
@@ -368,12 +369,43 @@ def _source_snapshot(
     "pinned Teleopit XML and checkpoint are required",
 )
 class SourceHistoryLifecycleTest(unittest.TestCase):
+    def test_cuda_request_never_silently_falls_back_to_cpu(self) -> None:
+        import onnxruntime as ort
+
+        if "CUDAExecutionProvider" in ort.get_available_providers():
+            self.skipTest("this environment has the requested CUDA provider")
+        with self.assertRaisesRegex(TeleopitAdapterError, "CUDAExecutionProvider"):
+            TeleopitController(
+                checkpoint=CHECKPOINT,
+                robot_xml=ROBOT_XML,
+                device="cuda",
+                require_source_history=True,
+            )
+
     def _payload_and_reference(self):
         rng = np.random.default_rng(901)
+        velocity_model = mujoco.MjModel.from_xml_path(str(ROBOT_XML))
+        velocity_data = mujoco.MjData(velocity_model)
+        velocity_neutral_qpos = velocity_data.qpos.copy()
+        joint_qpos_addresses = np.asarray(
+            [
+                velocity_model.jnt_qposadr[velocity_model.joint(name).id]
+                for name in G1_JOINT_NAMES
+            ],
+            dtype=np.int32,
+        )
+        joint_dof_addresses = np.asarray(
+            [
+                velocity_model.jnt_dofadr[velocity_model.joint(name).id]
+                for name in G1_JOINT_NAMES
+            ],
+            dtype=np.int32,
+        )
+        pelvis_id = velocity_model.body("pelvis").id
         policy_seq = np.arange(99, 110, dtype=np.int64)
         qpos36: list[np.ndarray] = []
         snapshots: list[dict[str, object]] = []
-        measured_states: list[RobotState] = []
+        measured_states: list[SimpleNamespace] = []
         for index, sequence in enumerate(policy_seq):
             joint_pos = DEFAULT_DOF_POS + rng.normal(0.0, 0.03, 29).astype(np.float32)
             joint_vel = rng.normal(0.0, 0.08, 29).astype(np.float32)
@@ -396,16 +428,48 @@ class SourceHistoryLifecycleTest(unittest.TestCase):
             snapshot = _source_snapshot(
                 int(sequence), joint_pos, joint_vel, source_raw
             )
+            velocity_data.qpos[:] = velocity_neutral_qpos
+            velocity_data.qvel[:] = 0.0
+            velocity_data.qpos[3:7] = np.asarray(
+                snapshot["base_quat"], dtype=np.float64
+            )
+            velocity_data.qpos[joint_qpos_addresses] = joint_pos
+            velocity_data.qvel[3:6] = np.asarray(
+                snapshot["base_ang_vel"], dtype=np.float64
+            )
+            velocity_data.qvel[joint_dof_addresses] = joint_vel
+            mujoco.mj_forward(velocity_model, velocity_data)
+            pelvis_velocity_local = np.zeros(6, dtype=np.float64)
+            mujoco.mj_objectVelocity(
+                velocity_model,
+                velocity_data,
+                mujoco.mjtObj.mjOBJ_BODY,
+                pelvis_id,
+                pelvis_velocity_local,
+                1,
+            )
             if index > 0:
                 snapshots.append(snapshot)
             measured_states.append(
-                RobotState(
+                SimpleNamespace(
                     joint_pos=joint_pos,
                     joint_vel=joint_vel,
                     root_pos=np.asarray([1.2, -0.7, 0.77], dtype=np.float32),
                     root_quat_wxyz=np.asarray(snapshot["base_quat"], dtype=np.float32),
-                    root_ang_vel_b=np.asarray(
-                        snapshot["base_ang_vel"], dtype=np.float32
+                    teleopit_pelvis_ang_vel_b=np.asarray(
+                        pelvis_velocity_local[:3], dtype=np.float32
+                    ),
+                    # Deliberately different: Teleopit must not consume the
+                    # SONIC free-joint angular-velocity field.
+                    sonic_base_ang_vel_qvel=np.asarray(
+                        [81.0, 82.0, 83.0], dtype=np.float32
+                    ),
+                    received_dof_pos=np.concatenate(
+                        (
+                            joint_pos,
+                            np.linspace(0.0, 0.3, 7, dtype=np.float32),
+                            np.linspace(0.3, 0.0, 7, dtype=np.float32),
+                        )
                     ),
                     timestamp_s=float(sequence) / 50.0,
                 )
@@ -470,6 +534,10 @@ class SourceHistoryLifecycleTest(unittest.TestCase):
             DEFAULT_DOF_POS + ACTION_SCALE * np.clip(step.raw_action, -10.0, 10.0),
             rtol=0.0,
             atol=2e-7,
+        )
+        self.assertEqual(step.received_dof_pos.shape, (43,))
+        np.testing.assert_array_equal(
+            step.received_dof_pos, current_state.received_dof_pos
         )
         self.assertEqual(
             controller.metadata()["history_initialization"],

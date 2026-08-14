@@ -15,10 +15,14 @@ without one controller accidentally mutating another controller's input.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
+import hashlib
+import json
 import math
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, ClassVar, Protocol, Sequence, runtime_checkable
 
 import numpy as np
@@ -37,6 +41,31 @@ SONIC_ACTIVE_REFERENCE_WIDTH = 640
 TELEOPIT_QPOS_WIDTH = 36
 CONSECUTIVE_SLOT_OFFSETS: tuple[int, ...] = tuple(range(NUM_SONIC_SLOTS))
 REGULAR_QPOS_SLOT_OFFSETS: tuple[int, ...] = tuple(range(0, 50, 5))
+PREPARED_REFERENCE_FORMAT_VERSION = 3
+
+_REFERENCE_ARRAY_FIELDS: tuple[str, ...] = (
+    "policy_seq",
+    "control_time_s",
+    "source_row_index",
+    "source_csv_row_number",
+    "group_row_counts",
+    "source_root_pos",
+    "source_root_quat_wxyz",
+    "left_hand_target",
+    "right_hand_target",
+    "sonic_regular_joint_pos",
+    "sonic_regular_joint_vel",
+    "sonic_regular_anchor_quat_wxyz",
+    "sonic_consecutive_joint_pos",
+    "sonic_consecutive_joint_vel",
+    "sonic_consecutive_anchor_quat_wxyz",
+    "teleopit_qpos36",
+    "teleopit_reference_joint_vel",
+)
+_OPTIONAL_REFERENCE_ARRAY_FIELDS: tuple[str, ...] = (
+    "source_reference_motion",
+    "source_recorded_relative_anchor_6d",
+)
 
 
 class ReferenceError(ValueError):
@@ -48,6 +77,21 @@ class ReferenceMode(str, Enum):
 
     REFERENCE_MOTION = "reference_motion"
     EXECUTED_QPOS = "executed_qpos"
+
+
+def _scalar_archive_value(value: np.ndarray, *, name: str) -> Any:
+    array = np.asarray(value)
+    if array.shape != ():
+        raise ReferenceError(f"prepared reference field {name!r} must be scalar")
+    return array.item()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _readonly_array(
@@ -228,12 +272,14 @@ class ReferenceSequence:
     teleopit_reference_joint_vel: np.ndarray
     source_reference_motion: np.ndarray | None = None
     source_recorded_relative_anchor_6d: np.ndarray | None = None
+    source_csv_sha256: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         source = Path(self.source_csv_path).expanduser().resolve()
         if not source.is_file():
             raise ReferenceError(f"source recording CSV does not exist: {source}")
         object.__setattr__(self, "source_csv_path", source)
+        object.__setattr__(self, "source_csv_sha256", _sha256_file(source))
         if not isinstance(self.provenance, ReferenceProvenance):
             raise ReferenceError("provenance must be a ReferenceProvenance")
 
@@ -597,10 +643,300 @@ class ReferenceSequence:
         )
         return ReferenceSequence(**values)
 
+    def save_prepared_npz(self, path: str | Path) -> Path:
+        """Atomically save every controller-neutral reference array.
+
+        The archive deliberately contains no object arrays, so consumers can
+        and should open it with ``allow_pickle=False``.  Optional source-only
+        arrays are represented by an explicit scalar presence flag rather than
+        a pickled ``None`` value.
+        """
+
+        destination = Path(path).expanduser()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source_csv = self.source_csv_path.expanduser().resolve()
+        if not source_csv.is_file():
+            raise ReferenceError(f"source CSV does not exist: {source_csv}")
+        source_csv_sha256 = _sha256_file(source_csv)
+        if source_csv_sha256 != self.source_csv_sha256:
+            raise ReferenceError(
+                "source CSV changed after this reference sequence was built"
+            )
+        payload: dict[str, np.ndarray] = {
+            "prepared_reference_format_version": np.asarray(
+                PREPARED_REFERENCE_FORMAT_VERSION, dtype=np.int64
+            ),
+            "sonic_joint_names": np.asarray(
+                G1_ISAACLAB_JOINT_NAMES, dtype=np.str_
+            ),
+            "teleopit_joint_names": np.asarray(
+                TELEOPIT_G1_JOINT_NAMES, dtype=np.str_
+            ),
+            "source_csv_sha256": np.asarray(
+                source_csv_sha256, dtype=np.str_
+            ),
+        }
+        for name in _REFERENCE_ARRAY_FIELDS:
+            payload[name] = np.asarray(getattr(self, name))
+        optional_presence: dict[str, bool] = {}
+        for name in _OPTIONAL_REFERENCE_ARRAY_FIELDS:
+            value = getattr(self, name)
+            present = value is not None
+            optional_presence[name] = present
+            payload[f"{name}__present"] = np.asarray(present, dtype=np.bool_)
+            if present:
+                payload[name] = np.asarray(value)
+
+        metadata = self.metadata()
+        metadata["prepared_reference_format_version"] = (
+            PREPARED_REFERENCE_FORMAT_VERSION
+        )
+        metadata["optional_arrays"] = optional_presence
+        metadata["source_csv_sha256"] = source_csv_sha256
+        payload["metadata_json"] = np.asarray(
+            json.dumps(metadata, ensure_ascii=False, sort_keys=True), dtype=np.str_
+        )
+        for name, value in payload.items():
+            if np.asarray(value).dtype.hasobject:
+                raise ReferenceError(
+                    f"prepared reference field {name!r} would require pickle"
+                )
+
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(file_descriptor, "wb") as output:
+                np.savez_compressed(output, **payload)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary_path, destination)
+        except BaseException:
+            temporary_path.unlink(missing_ok=True)
+            raise
+        return destination
+
+    @classmethod
+    def load_prepared_npz(
+        cls,
+        path: str | Path,
+        *,
+        source_csv_path: str | Path | None = None,
+    ) -> "ReferenceSequence":
+        """Load and fully revalidate an archive written by
+        :meth:`save_prepared_npz`.
+
+        ``source_csv_path`` may point to a relocated copy of the source CSV.
+        The regular :class:`ReferenceSequence` invariants are rerun after
+        decoding, so this helper is also the archive round-trip validator.
+        """
+
+        archive_path = Path(path).expanduser().resolve()
+        if not archive_path.is_file():
+            raise ReferenceError(
+                f"prepared reference archive does not exist: {archive_path}"
+            )
+        try:
+            with np.load(archive_path, allow_pickle=False) as archive:
+                for name in archive.files:
+                    if archive[name].dtype.hasobject:
+                        raise ReferenceError(
+                            f"prepared reference field {name!r} requires pickle"
+                        )
+                required = {
+                    "prepared_reference_format_version",
+                    "sonic_joint_names",
+                    "teleopit_joint_names",
+                    "source_csv_sha256",
+                    "metadata_json",
+                    *_REFERENCE_ARRAY_FIELDS,
+                    *(f"{name}__present" for name in _OPTIONAL_REFERENCE_ARRAY_FIELDS),
+                }
+                missing = sorted(required.difference(archive.files))
+                if missing:
+                    raise ReferenceError(
+                        f"prepared reference archive is missing fields {missing}"
+                    )
+                version = _scalar_archive_value(
+                    archive["prepared_reference_format_version"],
+                    name="prepared_reference_format_version",
+                )
+                if int(version) != PREPARED_REFERENCE_FORMAT_VERSION:
+                    raise ReferenceError(
+                        "unsupported prepared reference format version "
+                        f"{version!r}; expected {PREPARED_REFERENCE_FORMAT_VERSION}"
+                    )
+                metadata_text = _scalar_archive_value(
+                    archive["metadata_json"], name="metadata_json"
+                )
+                try:
+                    metadata = json.loads(str(metadata_text))
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ReferenceError(
+                        "prepared reference metadata_json is not valid JSON"
+                    ) from exc
+                if not isinstance(metadata, dict):
+                    raise ReferenceError(
+                        "prepared reference metadata_json must contain an object"
+                    )
+                archived_source_sha256 = str(
+                    _scalar_archive_value(
+                        archive["source_csv_sha256"],
+                        name="source_csv_sha256",
+                    )
+                )
+                if (
+                    len(archived_source_sha256) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in archived_source_sha256
+                    )
+                ):
+                    raise ReferenceError(
+                        "prepared reference source_csv_sha256 is invalid"
+                    )
+                sonic_names = tuple(
+                    str(value) for value in np.asarray(archive["sonic_joint_names"])
+                )
+                teleopit_names = tuple(
+                    str(value) for value in np.asarray(archive["teleopit_joint_names"])
+                )
+                if sonic_names != tuple(G1_ISAACLAB_JOINT_NAMES):
+                    raise ReferenceError(
+                        "prepared reference SONIC joint names/order do not match"
+                    )
+                if teleopit_names != tuple(TELEOPIT_G1_JOINT_NAMES):
+                    raise ReferenceError(
+                        "prepared reference Teleopit joint names/order do not match"
+                    )
+
+                values: dict[str, Any] = {
+                    name: np.array(archive[name], copy=True)
+                    for name in _REFERENCE_ARRAY_FIELDS
+                }
+                optional_presence: dict[str, bool] = {}
+                for name in _OPTIONAL_REFERENCE_ARRAY_FIELDS:
+                    raw_present = _scalar_archive_value(
+                        archive[f"{name}__present"],
+                        name=f"{name}__present",
+                    )
+                    if not isinstance(raw_present, (bool, np.bool_)):
+                        raise ReferenceError(
+                            f"{name}__present must be a scalar boolean"
+                        )
+                    present = bool(raw_present)
+                    optional_presence[name] = present
+                    if present and name not in archive.files:
+                        raise ReferenceError(
+                            f"{name} is marked present but absent from the archive"
+                        )
+                    if not present and name in archive.files:
+                        raise ReferenceError(
+                            f"{name} is marked absent but is stored in the archive"
+                        )
+                    values[name] = (
+                        np.array(archive[name], copy=True) if present else None
+                    )
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, ReferenceError):
+                raise
+            raise ReferenceError(
+                f"failed to read prepared reference archive {archive_path}: {exc}"
+            ) from exc
+
+        metadata_optional = metadata.get("optional_arrays")
+        if metadata_optional != optional_presence:
+            raise ReferenceError(
+                "prepared reference optional-array flags disagree with metadata_json"
+            )
+        source = (
+            Path(str(metadata.get("source_csv", "")))
+            if source_csv_path is None
+            else Path(source_csv_path)
+        )
+        source = source.expanduser().resolve()
+        if not source.is_file():
+            raise ReferenceError(
+                f"prepared reference source CSV does not exist: {source}"
+            )
+        actual_source_sha256 = _sha256_file(source)
+        if actual_source_sha256 != archived_source_sha256:
+            raise ReferenceError(
+                "prepared reference source CSV SHA-256 mismatch: "
+                f"expected {archived_source_sha256}, got {actual_source_sha256}"
+            )
+        if metadata.get("source_csv_sha256") != archived_source_sha256:
+            raise ReferenceError(
+                "prepared reference source SHA-256 disagrees with metadata_json"
+            )
+        component_sources = metadata.get("component_sources")
+        if not isinstance(component_sources, dict):
+            raise ReferenceError(
+                "prepared reference metadata has no component_sources object"
+            )
+        try:
+            provenance = ReferenceProvenance(
+                mode=ReferenceMode(str(metadata["reference_mode"])),
+                reference_kind=str(metadata["reference_kind"]),
+                regular_slot_source=str(metadata["regular_slot_source"]),
+                regular_slot_offsets=(
+                    None
+                    if metadata["regular_slot_offsets"] is None
+                    else tuple(int(value) for value in metadata["regular_slot_offsets"])
+                ),
+                orientation_base_sample_mode=(
+                    None
+                    if metadata["orientation_base_sample_mode"] is None
+                    else str(metadata["orientation_base_sample_mode"])
+                ),
+                component_sources=tuple(
+                    (str(key), str(value))
+                    for key, value in component_sources.items()
+                ),
+                source_frame_count=int(metadata["source_frames_after_edge_trim"]),
+                selected_policy_offset=int(metadata["selected_policy_offset"]),
+                drop_truncated_edges=bool(metadata["drop_truncated_edges"]),
+                policy_alignment_max_time_error_s=float(
+                    metadata["policy_alignment_max_time_error_s"]
+                ),
+                policy_alignment_max_hand_error=float(
+                    metadata["policy_alignment_max_hand_error"]
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReferenceError(
+                "prepared reference metadata cannot reconstruct provenance"
+            ) from exc
+        result = cls(source_csv_path=source, provenance=provenance, **values)
+
+        expected_metadata = result.metadata()
+        for key, expected in expected_metadata.items():
+            if key == "source_csv" and source_csv_path is not None:
+                continue
+            if metadata.get(key) != expected:
+                raise ReferenceError(
+                    f"prepared reference metadata field {key!r} disagrees with arrays"
+                )
+        if metadata.get("source_csv_sha256") != actual_source_sha256:
+            raise ReferenceError(
+                "prepared reference metadata source SHA-256 changed"
+            )
+        if metadata.get("prepared_reference_format_version") != (
+            PREPARED_REFERENCE_FORMAT_VERSION
+        ):
+            raise ReferenceError(
+                "prepared reference metadata has the wrong format version"
+            )
+        return result
+
     def metadata(self) -> dict[str, Any]:
         return {
             "schema_version": self.SCHEMA_VERSION,
             "source_csv": str(self.source_csv_path),
+            "source_csv_sha256": self.source_csv_sha256,
             "rate_hz": POLICY_RATE_HZ,
             "policy_dt_s": POLICY_DT_S,
             "selected_frames": self.num_frames,
@@ -617,6 +953,9 @@ class ReferenceSequence:
             "teleopit_joint_names": list(TELEOPIT_G1_JOINT_NAMES),
             "hand_target_layout": "left_hand_q[0:7] / right_hand_q[0:7]",
             "source_reference_motion_present": self.source_reference_motion is not None,
+            "source_recorded_relative_anchor_6d_present": (
+                self.source_recorded_relative_anchor_6d is not None
+            ),
             **self.provenance.metadata(),
         }
 

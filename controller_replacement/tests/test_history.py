@@ -15,11 +15,14 @@ from change_ckpt.source_history_prefill import (
 )
 from change_ckpt_track.qpos_reference_data import G1_MUJOCO_JOINT_NAMES
 from controller_replacement.history import (
+    DEFAULT_RAW_POLICY_GROUP_OFFSET,
     SourceHistoryContextError,
     build_source_history_context,
+    load_reference_from_raw_policy_group,
     resolve_raw_policy_group_offset,
     write_source_history_artifacts,
 )
+from controller_replacement.launch_rollout import build_parser
 from controller_replacement.references import load_reference
 
 
@@ -134,6 +137,16 @@ class _FakeTeleopitObservationBuilder:
     """Duck-typed deterministic builder that exposes the adapter contract."""
 
     @staticmethod
+    def source_pelvis_ang_vel_b(
+        base_quat: np.ndarray,
+        joint_pos: np.ndarray,
+        joint_vel: np.ndarray,
+        base_ang_vel_qvel: np.ndarray,
+    ) -> np.ndarray:
+        del base_quat, joint_pos, joint_vel
+        return np.asarray(base_ang_vel_qvel, dtype=np.float32)
+
+    @staticmethod
     def reference_features(current: np.ndarray, previous: np.ndarray) -> np.ndarray:
         return np.concatenate((np.asarray(current), np.asarray(previous)))
 
@@ -160,13 +173,19 @@ class SourceHistoryContextTest(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.recording = _write_recording(Path(self.temporary.name))
 
+    def test_launcher_defaults_to_twelfth_raw_group(self) -> None:
+        args = build_parser().parse_args(
+            [str(self.recording), "--controller", "regular"]
+        )
+        self.assertEqual(args.raw_policy_group_offset, 11)
+
     def test_exact_policy_selection_survives_truncated_edge_trim(self) -> None:
-        # The one-row raw group 5000 is trimmed.  Processed offset 10 therefore
-        # selects raw offset 11 (policy 5011), not raw offset 10.
-        reference = load_reference(
+        # The one-row raw group 5000 is trimmed.  Raw offset 11 must still
+        # select policy 5011 even though its processed reference index is 10.
+        reference = load_reference_from_raw_policy_group(
             self.recording,
             mode="executed_qpos",
-            policy_offset=10,
+            raw_policy_group_offset=DEFAULT_RAW_POLICY_GROUP_OFFSET,
             policy_count=2,
         )
         self.assertEqual(int(reference.policy_seq[0]), 5011)
@@ -196,9 +215,27 @@ class SourceHistoryContextTest(unittest.TestCase):
         self.assertIsNone(context.teleopit_prefill)
         metadata = context.metadata()
         self.assertEqual(metadata["reference_mode"], "executed_qpos")
+        self.assertEqual(metadata["raw_policy_group_offset"], 11)
         self.assertEqual(metadata["resolved_raw_policy_group_offset"], 11)
         self.assertEqual(metadata["excluded_initialization_modes"][0], "zero_padding")
         json.dumps(metadata)
+
+    def test_raw_offset_is_independent_of_complete_first_group(self) -> None:
+        complete_root = Path(self.temporary.name) / "complete"
+        complete_root.mkdir()
+        complete = _write_recording(complete_root, first_group_rows=8)
+        reference = load_reference_from_raw_policy_group(
+            complete,
+            mode="executed_qpos",
+            raw_policy_group_offset=DEFAULT_RAW_POLICY_GROUP_OFFSET,
+            policy_count=1,
+        )
+        self.assertEqual(int(reference.policy_seq[0]), 5011)
+        self.assertEqual(reference.provenance.selected_policy_offset, 11)
+        context = build_source_history_context(
+            complete, selected_reference=reference
+        )
+        self.assertEqual(context.raw_policy_group_offset, 11)
 
     def test_teleopit_prefill_loads_predecessor_of_oldest_history(self) -> None:
         reference = load_reference(
