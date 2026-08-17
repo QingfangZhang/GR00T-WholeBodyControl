@@ -156,7 +156,7 @@ python change_ckpt_track/launch_checkpoint_rollout.py preflight \
 regular:
   change_ckpt/models/regular/model_encoder.onnx
   change_ckpt/models/regular/model_decoder.onnx
-  change_ckpt/observation_config_sonic_release.yaml
+  change_ckpt/models/regular/observation_config.yaml
 
 low_latency:
   change_ckpt/models/low_latency/model_encoder.onnx

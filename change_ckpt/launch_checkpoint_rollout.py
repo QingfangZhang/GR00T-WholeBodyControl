@@ -157,6 +157,10 @@ ENCODER_OBSERVATION_DIMS: dict[str, int] = {
     "motion_anchor_orientation_heading_10frame_step1": 60,
     "motion_anchor_orientation_heading": 6,
     "motion_anchor_orientation": 6,
+    "motion_root_z_position": 1,
+    "motion_root_z_position_10frame_step5": 10,
+    "motion_root_z_position_10frame_step1": 10,
+    "motion_root_z_position_3frame_step1": 3,
     "motion_joint_positions_lowerbody_10frame_step5": 120,
     "motion_joint_velocities_lowerbody_10frame_step5": 120,
     "motion_joint_positions_lowerbody_10frame_step1": 120,
@@ -302,15 +306,6 @@ def _normalise_checkpoint(name: str) -> str:
         raise PreflightError(f"Unsupported checkpoint name: {name}") from exc
 
 
-def _find_regular_export_pair() -> tuple[Path, Path] | None:
-    export_dir = CHANGE_ROOT / "models/regular_source/exported"
-    for encoder in sorted(export_dir.glob("model_step_*_encoder.onnx"), reverse=True):
-        decoder = encoder.with_name(encoder.name.replace("_encoder.onnx", "_decoder.onnx"))
-        if decoder.is_file():
-            return encoder, decoder
-    return None
-
-
 def resolve_model_files(args: argparse.Namespace) -> ModelFiles:
     checkpoint = _normalise_checkpoint(args.checkpoint)
     if checkpoint == "low_latency":
@@ -326,11 +321,8 @@ def resolve_model_files(args: argparse.Namespace) -> ModelFiles:
     else:
         default_encoder = CHANGE_ROOT / "models/regular/model_encoder.onnx"
         default_decoder = CHANGE_ROOT / "models/regular/model_decoder.onnx"
-        discovered = _find_regular_export_pair()
-        if discovered and not (default_encoder.is_file() and default_decoder.is_file()):
-            default_encoder, default_decoder = discovered
-        default_config = CHANGE_ROOT / "observation_config_sonic_release.yaml"
-        encoder_input = 1751
+        default_config = CHANGE_ROOT / "models/regular/observation_config.yaml"
+        encoder_input = 1762
 
     encoder = Path(args.encoder).expanduser() if args.encoder else default_encoder
     decoder = Path(args.decoder).expanduser() if args.decoder else default_decoder
@@ -357,16 +349,13 @@ def _recording_csv(recording: Path) -> Path:
 
 def _regular_export_help() -> str:
     return f"""
-Regular ONNX has not been exported under change_ckpt yet.
-Keep the original checkpoint/config untouched and use the standalone exporter:
+Official regular release files are missing under:
+  {CHANGE_ROOT / "models/regular"}
 
-  python change_ckpt/export_regular_g1_onnx.py \\
-      --output-dir change_ckpt/models/regular \\
-      --validate-recording {shlex.quote(str(DEFAULT_RECORDING))}
-
-This writes model_encoder.onnx and model_decoder.onnx without editing the
-original training/evaluation source.  You may also export to another directory
-and pass --encoder/--decoder explicitly.
+Download model_encoder.onnx, model_decoder.onnx, and observation_config.yaml
+from nvidia/GEAR-SONIC into that directory.  The optional legacy checkpoint
+exporter writes its 1751-D G1-only models to a separate directory and must not
+replace the official 1762-D release pair.
 """.strip()
 
 

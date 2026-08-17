@@ -171,7 +171,7 @@ class SonicControllerUnitTest(unittest.TestCase):
         low_latency, _, _ = _fake_controller("low_latency")
         regular_input = regular.build_encoder_input(state, reference)
         low_input = low_latency.build_encoder_input(state, reference)
-        self.assertEqual(regular_input.shape, (1751,))
+        self.assertEqual(regular_input.shape, (1762,))
         self.assertEqual(low_input.shape, (1247,))
         np.testing.assert_array_equal(
             regular_input[4:294], reference.sonic_regular_joint_pos.reshape(-1)
@@ -188,9 +188,23 @@ class SonicControllerUnitTest(unittest.TestCase):
         expected_identity_6d = np.tile(
             np.asarray([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]), 10
         )
-        np.testing.assert_allclose(regular_input[584:644], expected_identity_6d)
-        self.assertTrue(np.all(regular_input[644:] == 0.0))
+        # The official regular wrapper reserves 11 disabled root-height values
+        # and one disabled single-frame orientation before the G1 ten-slot
+        # orientation block.
+        self.assertTrue(np.all(regular_input[584:601] == 0.0))
+        np.testing.assert_allclose(regular_input[601:661], expected_identity_6d)
+        self.assertTrue(np.all(regular_input[661:] == 0.0))
         self.assertTrue(np.all(low_input[644:] == 0.0))
+        np.testing.assert_array_equal(
+            regular.reference_motion_from_encoder_input(regular_input),
+            np.concatenate(
+                (
+                    reference.sonic_regular_joint_pos.reshape(-1),
+                    reference.sonic_regular_joint_vel.reshape(-1),
+                    expected_identity_6d,
+                )
+            ).astype(np.float32),
+        )
 
     def test_v11_uses_robot_heading_instead_of_full_orientation(self) -> None:
         reference = _identity_reference()
@@ -214,8 +228,12 @@ class SonicControllerUnitTest(unittest.TestCase):
         state = _state(quaternion=quaternion)
         regular, _, _ = _fake_controller("regular")
         v11, _, _ = _fake_controller("sonic_v1_1")
-        regular_orientation = regular.build_encoder_input(state, reference)[584:644]
-        v11_orientation = v11.build_encoder_input(state, reference)[584:644]
+        regular_orientation = regular.g1_anchor_orientation_from_encoder_input(
+            regular.build_encoder_input(state, reference)
+        ).reshape(-1)
+        v11_orientation = v11.g1_anchor_orientation_from_encoder_input(
+            v11.build_encoder_input(state, reference)
+        ).reshape(-1)
         self.assertGreater(float(np.max(np.abs(regular_orientation - v11_orientation))), 0.1)
 
     def test_decoder_input_has_exact_block_order_and_shape(self) -> None:
@@ -368,7 +386,7 @@ class SonicControllerUnitTest(unittest.TestCase):
 class SonicOnnxRegressionTest(unittest.TestCase):
     def test_all_released_onnx_signatures(self) -> None:
         expected = {
-            SonicVariant.REGULAR: 1751,
+            SonicVariant.REGULAR: 1762,
             SonicVariant.LOW_LATENCY: 1247,
             SonicVariant.SONIC_V1_1: 1751,
         }

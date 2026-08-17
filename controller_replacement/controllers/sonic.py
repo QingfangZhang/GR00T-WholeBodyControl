@@ -12,10 +12,12 @@ There are two joint orders in this path and they must not be conflated:
 * SONIC reference arrays, decoder histories, raw actions, and both ONNX models
   use the interleaved IsaacLab order.
 
-The regular encoder ONNX in ``change_ckpt/models/regular`` already contains
-the historical training-time ``[q+dq] -> [10,58]`` reshape.  Consequently this
-adapter supplies the canonical C++ input slice ``q[290], dq[290], ori[60]``;
-it must not apply that reshape a second time.
+The released encoders are multiplexed across G1, teleop, and SMPL modes.  The
+official regular wrapper has a 1762-D input and places the G1 ten-slot anchor
+orientation at offset 601 after 11 disabled root-height slots and one disabled
+single-frame orientation slot.  Low-latency and SONIC v1.1 retain offset 584.
+This adapter keeps those wrapper layouts explicit while exposing the same
+canonical 640-D ``q[290], dq[290], orientation[60]`` reference for logging.
 """
 
 from __future__ import annotations
@@ -210,6 +212,7 @@ class SonicModelSpec:
     encoder_path: Path
     decoder_path: Path
     encoder_input_dim: int
+    g1_orientation_offset: int
     orientation_mode: str
     reference_view: str
 
@@ -218,17 +221,20 @@ def default_model_spec(variant: SonicVariant | str) -> SonicModelSpec:
     parsed = SonicVariant.parse(variant)
     if parsed is SonicVariant.REGULAR:
         directory = REPO_ROOT / "change_ckpt/models/regular"
-        dimension = 1751
+        dimension = 1762
+        orientation_offset = 601
         orientation_mode = "full_base"
         view = "regular"
     elif parsed is SonicVariant.LOW_LATENCY:
         directory = REPO_ROOT / "change_ckpt/models/low_latency"
         dimension = 1247
+        orientation_offset = 584
         orientation_mode = "full_base"
         view = "consecutive"
     else:
         directory = REPO_ROOT / "change_ckpt/models/v1.1"
         dimension = 1751
+        orientation_offset = 584
         orientation_mode = "robot_heading"
         view = "regular"
     return SonicModelSpec(
@@ -236,6 +242,7 @@ def default_model_spec(variant: SonicVariant | str) -> SonicModelSpec:
         encoder_path=directory / "model_encoder.onnx",
         decoder_path=directory / "model_decoder.onnx",
         encoder_input_dim=dimension,
+        g1_orientation_offset=orientation_offset,
         orientation_mode=orientation_mode,
         reference_view=view,
     )
@@ -505,6 +512,7 @@ class SonicController:
                 else Path(decoder_path).expanduser().resolve()
             ),
             encoder_input_dim=default.encoder_input_dim,
+            g1_orientation_offset=default.g1_orientation_offset,
             orientation_mode=default.orientation_mode,
             reference_view=default.reference_view,
         )
@@ -612,6 +620,7 @@ class SonicController:
                 "sha256": self.loaded_model_sha256["encoder"],
                 "input_dimension": self.spec.encoder_input_dim,
                 "output_dimension": TOKEN_DIM,
+                "g1_orientation_offset": self.spec.g1_orientation_offset,
             },
             "decoder": {
                 "path": str(self.spec.decoder_path),
@@ -787,8 +796,33 @@ class SonicController:
         # branches stay zero because the ONNX is a shared multiplexed model.
         result[4:294] = positions.reshape(-1)
         result[294:584] = velocities.reshape(-1)
-        result[584:644] = orientation.reshape(-1)
+        orientation_start = self.spec.g1_orientation_offset
+        result[orientation_start : orientation_start + 60] = orientation.reshape(-1)
         return result
+
+    def g1_anchor_orientation_from_encoder_input(
+        self, encoder_input: Any
+    ) -> FloatArray:
+        """Return the ten 6D anchor-orientation slots consumed by G1 mode."""
+
+        value = _finite_vector(
+            encoder_input,
+            self.spec.encoder_input_dim,
+            "SONIC encoder input",
+        )
+        start = self.spec.g1_orientation_offset
+        return value[start : start + 60].reshape(10, 6).copy()
+
+    def reference_motion_from_encoder_input(self, encoder_input: Any) -> FloatArray:
+        """Return canonical ``q[290], dq[290], orientation[60]`` logging data."""
+
+        value = _finite_vector(
+            encoder_input,
+            self.spec.encoder_input_dim,
+            "SONIC encoder input",
+        )
+        orientation = self.g1_anchor_orientation_from_encoder_input(value).reshape(-1)
+        return np.concatenate((value[4:584], orientation)).astype(np.float32)
 
     @staticmethod
     def build_decoder_input(token: Any, history: Sequence[SonicHistoryFrame]) -> FloatArray:

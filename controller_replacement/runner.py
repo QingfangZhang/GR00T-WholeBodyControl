@@ -644,8 +644,10 @@ def _controller_reference_signals(
     """Decode only reference signals that the network actually consumed."""
 
     if isinstance(controller, SonicController):
-        encoder_input = np.asarray(step.encoder_input, dtype=np.float64).reshape(-1)
-        relative_rot6d = encoder_input[584:590].copy()
+        orientations = controller.g1_anchor_orientation_from_encoder_input(
+            step.encoder_input
+        )
+        relative_rot6d = np.asarray(orientations[0], dtype=np.float64).copy()
         return {
             "relative_anchor_rot6d": relative_rot6d,
             "orientation_error_rad": rot6d_orientation_error_rad(relative_rot6d),
@@ -687,7 +689,7 @@ def _telemetry_record(
     # depend on the live robot orientation and therefore cannot be represented
     # by blindly copying the recording's stored reference_motion columns.
     reference_native = (
-        step.encoder_input[4:644]
+        controller.reference_motion_from_encoder_input(step.encoder_input)
         if isinstance(controller, SonicController)
         else reference.teleopit_qpos36
     )
@@ -1132,7 +1134,9 @@ def _run_rollout_impl(
                     else None
                 ),
                 reference_motion=(
-                    current_step.encoder_input[4:644]
+                    controller.reference_motion_from_encoder_input(
+                        current_step.encoder_input
+                    )
                     if isinstance(controller, SonicController)
                     else None
                 ),
@@ -1225,7 +1229,13 @@ def _run_rollout_impl(
         },
         "controller_reference_anchor_orientation": {
             "provider": (
-                "SONIC encoder_input[584:590] or Teleopit observation[58:64]"
+                (
+                    "SONIC encoder_input"
+                    f"[{controller.spec.g1_orientation_offset}:"
+                    f"{controller.spec.g1_orientation_offset + 6}]"
+                )
+                if isinstance(controller, SonicController)
+                else "Teleopit observation[58:64]"
             ),
             "metric": "orthonormalized rot6d geodesic angle",
             "absolute_root_xy_available": False,

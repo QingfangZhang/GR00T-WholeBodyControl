@@ -320,6 +320,35 @@ class SourceHistoryLauncherTest(unittest.TestCase):
 
 
 class SonicV11LauncherTest(unittest.TestCase):
+    def test_regular_defaults_use_official_release_files(self) -> None:
+        args = launcher.build_parser().parse_args(
+            ["preflight", "--checkpoint", "regular", "--models-only"]
+        )
+        model = launcher.resolve_model_files(args)
+        self.assertEqual(model.name, "regular")
+        self.assertEqual(model.expected_encoder_input, 1762)
+        self.assertEqual(
+            model.encoder,
+            (
+                launcher.REPO_ROOT
+                / "change_ckpt/models/regular/model_encoder.onnx"
+            ).resolve(),
+        )
+        self.assertEqual(
+            model.decoder,
+            (
+                launcher.REPO_ROOT
+                / "change_ckpt/models/regular/model_decoder.onnx"
+            ).resolve(),
+        )
+        self.assertEqual(
+            model.obs_config,
+            (
+                launcher.REPO_ROOT
+                / "change_ckpt/models/regular/observation_config.yaml"
+            ).resolve(),
+        )
+
     def test_model_defaults_and_aliases(self) -> None:
         parser = launcher.build_parser()
         for alias in (

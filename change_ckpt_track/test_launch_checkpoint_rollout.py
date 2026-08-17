@@ -50,7 +50,7 @@ class QposTrackLauncherTest(unittest.TestCase):
             ["preflight", "--checkpoint", "regular", "--models-only"]
         )
         regular = launcher.resolve_model_files(regular_args)
-        self.assertEqual(regular.expected_encoder_input, 1751)
+        self.assertEqual(regular.expected_encoder_input, 1762)
         self.assertEqual(
             regular.encoder,
             (
@@ -62,7 +62,7 @@ class QposTrackLauncherTest(unittest.TestCase):
             regular.obs_config,
             (
                 launcher.REPO_ROOT
-                / "change_ckpt/observation_config_sonic_release.yaml"
+                / "change_ckpt/models/regular/observation_config.yaml"
             ).resolve(),
         )
         low_args = launcher.build_parser().parse_args(

@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Export the regular SONIC G1 encoder and dynamic decoder without Isaac Sim.
+"""Export the legacy regular SONIC G1 wrapper for checkpoint verification.
 
 This exporter is intentionally limited to the G1 encoder mode used by the CSV
 rollout experiment.  It reconstructs the two inference networks directly from
-``sonic_release/last.pt`` and writes models compatible with the current C++
-deployment input shapes:
+``sonic_release/last.pt`` and writes the historical G1-specialized models:
 
 * ``model_encoder.onnx``: 1751 -> 64
 * ``model_decoder.onnx``: 994 -> 29
+
+The official release encoder now used by the rollout launchers has a 1762-D
+multiplexed input.  Do not overwrite ``change_ckpt/models/regular`` with this
+1751-D verification export or pair it with the official observation config.
 
 The regular G1 observation has a historical training-time reshape that must be
 preserved.  The canonical C++ slice ``[q(290), dq(290), orientation(60)]`` is
@@ -35,7 +38,9 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT = REPO_ROOT / "sonic_release/last.pt"
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "change_ckpt/models/regular"
+# Keep this legacy, G1-specialized 1751-D export separate from the official
+# 1762-D release files stored in ``change_ckpt/models/regular``.
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "change_ckpt/models/regular_legacy_export"
 
 ENCODER_INPUT_DIM = 1751
 ENCODER_OUTPUT_DIM = 64

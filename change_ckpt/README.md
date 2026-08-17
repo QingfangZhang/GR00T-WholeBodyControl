@@ -66,20 +66,24 @@ future slots 已被截成 `[0,5,9,9,...]` 等形式，本实验会原样保留�
 “同一个实际采集 reference 信号换 controller”，不是 canonical
 `[0,5,10,...,45]` 重建实验。
 
-## 1. 导出并验证 regular ONNX
+## 1. regular 官方模型与可选的旧 checkpoint 验证
 
-regular 原 checkpoint 是 `sonic_release/last.pt`，需要先在 **isaaclab 环境**中导出。导出脚本不启动 Isaac Sim，它直接从 checkpoint 重建固定 G1 模式的 encoder 和 dynamic decoder：
+regular rollout 默认使用 NVIDIA GEAR-SONIC 发布的完整模型与配置，三份文件必须
+成套放在 `change_ckpt/models/regular/`：
 
-- `model_encoder.onnx`：`1751 -> 64`
+- `model_encoder.onnx`：`1762 -> 64`
 - `model_decoder.onnx`：`994 -> 29`
+- `observation_config.yaml`
 
-在项目根目录运行：
+它们不需要再次导出。`export_regular_g1_onnx.py` 仅保留用于复核旧
+`sonic_release/last.pt` checkpoint；该脚本生成的是 G1 专用 1751 维 wrapper，
+不应覆盖上述官方 1762 维模型。需要复核时，在 **isaaclab 环境**中输出到隔离目录：
 
 ```bash
 conda activate isaaclab
 python change_ckpt/export_regular_g1_onnx.py \
   --checkpoint sonic_release/last.pt \
-  --output-dir change_ckpt/models/regular \
+  --output-dir change_ckpt/models/regular_legacy_export \
   --validate-recording sample_data/ztj/20260612/20260720_144342_g1_sim \
   --validate-frames 575
 ```
@@ -90,7 +94,7 @@ python change_ckpt/export_regular_g1_onnx.py \
 - 导出的 ONNX encoder 与 CSV token；
 - ONNX encoder 与 PyTorch encoder。
 
-当前这份记录共有 575 个唯一 policy frame，已验证 575/575 的三组比较均为 `max_abs = 0`。这证明 regular G1 encoder 的历史 reshape、MLP、FSQ 以及 CSV 行对齐被精确复现；它不证明换 checkpoint 后闭环任务必然成功。导出的两个模型默认位于 `change_ckpt/models/regular/`，不会覆盖原 checkpoint。
+当前这份记录共有 575 个唯一 policy frame，已验证 575/575 的三组比较均为 `max_abs = 0`。这证明旧 regular G1 encoder 的历史 reshape、MLP、FSQ 以及 CSV 行对齐被精确复现；它不证明换 checkpoint 后闭环任务必然成功。隔离导出的模型只用于验证，不是 launcher 的默认输入。
 
 如果只想独立复查 CSV 的 640 维输入和原 checkpoint token，也可在 isaaclab 环境运行：
 
@@ -126,13 +130,24 @@ python change_ckpt/launch_checkpoint_rollout.py preflight \
   --recording sample_data/ztj/20260612/20260720_144342_g1_sim
 ```
 
-为防止 TensorRT 在 GPU/hash 变化时重写原目录，low-latency 和 planner 的 ONNX、配置及现有 TRT cache 都已复制到 `change_ckpt/models/`。low-latency 默认读取：
+为防止 TensorRT 在 GPU/hash 变化时重写原目录，各 checkpoint、planner 的 ONNX、配置及现有 TRT cache 都放在 `change_ckpt/models/`。low-latency 默认读取：
 
 - `change_ckpt/models/low_latency/model_encoder.onnx`
 - `change_ckpt/models/low_latency/model_decoder.onnx`
 - `change_ckpt/models/low_latency/observation_config.yaml`
 
-regular 默认读取上一节导出的 `change_ckpt/models/regular/model_{encoder,decoder}.onnx` 和 `change_ckpt/observation_config_sonic_release.yaml`。若模型放在其他位置，可给 `preflight` 和 `run` 同时传入 `--encoder`、`--decoder`，必要时再传 `--obs-config`。
+两个 C++ launcher 共用并实际加载的 planner 保留在：
+
+- `change_ckpt/models/planner/target_vel/V2/planner_sonic.onnx`
+- `change_ckpt/models/planner/target_vel/V2/planner_planner_sonic.trt`（同一 ONNX 的 TensorRT cache）
+
+regular 默认读取官方发布文件：
+
+- `change_ckpt/models/regular/model_encoder.onnx`
+- `change_ckpt/models/regular/model_decoder.onnx`
+- `change_ckpt/models/regular/observation_config.yaml`
+
+若模型放在其他位置，可给 `preflight` 和 `run` 同时传入 `--encoder`、`--decoder`，必要时再传 `--obs-config`；模型和配置的输入布局必须匹配。
 
 SONIC v1.1 默认读取：
 

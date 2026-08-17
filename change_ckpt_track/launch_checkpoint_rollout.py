@@ -276,10 +276,8 @@ def resolve_model_files(args: argparse.Namespace) -> ModelFiles:
         encoder_input = 1751
     else:
         model_root = CHECKPOINT_SOURCE_ROOT / "models/regular"
-        default_config = (
-            CHECKPOINT_SOURCE_ROOT / "observation_config_sonic_release.yaml"
-        )
-        encoder_input = 1751
+        default_config = model_root / "observation_config.yaml"
+        encoder_input = 1762
 
     encoder = (
         Path(args.encoder).expanduser()
@@ -450,7 +448,7 @@ def _raw_policy_offset_for_selected_frame(args: argparse.Namespace) -> int:
 
 def _regular_export_help() -> str:
     return f"""
-The fixed-G1 regular export used by change_ckpt is expected at:
+The official regular release encoder, decoder, and observation config are expected at:
   {CHECKPOINT_SOURCE_ROOT / "models/regular"}
 You may pass --encoder, --decoder, and --obs-config explicitly.
 """.strip()
