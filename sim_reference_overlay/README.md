@@ -76,6 +76,98 @@ The modes are mutually exclusive and selected at startup:
 
 The default is `reference`.
 
+## Staged real-robot reference
+
+`build_real_safe_reference.py` creates a guarded entry/exit wrapper without
+modifying the source NPZ or any official SONIC file. For the first staged
+`dun` experiment, run from the repository root:
+
+```bash
+.venv_sim/bin/python sim_reference_overlay/build_real_safe_reference.py \
+  sim_reference_overlay/data/npz/dun.npz \
+  --output-root sim_reference_overlay/data/csv_dun_real_safe \
+  --name dun_real_safe_stage1 \
+  --assume-isaaclab-order
+```
+
+The command refuses to overwrite an existing output directory. The default
+stage-1 interval is source frame 12 through 1158, inclusive. It adds:
+
+```text
+5 s policy-default hold
+5 s minimum-jerk entry
+1 s source-start settle
+source frames 13..1158
+0.5 s smooth brake
+1 s stopped hold
+6 s minimum-jerk return to policy-default joints
+5 s final hold
+```
+
+The output is intentionally named `dun_real_safe_stage1`, not complete `dun`:
+it retains 74.5 percent of the usable source frames. The excluded final quarter
+contains another high-dynamic return sequence. More importantly, the retained
+source still reaches about `12.97 rad/s` lower-body joint speed and a pelvis
+height of about `0.523 m`. "Safe" here means that the entry, exit, and held
+frame 0 were constructed and checked; it is not a safety certification for the
+source motion.
+
+After stage 1 has passed the required suspended tests, generate the fourth-stage
+near-full candidate with:
+
+```bash
+.venv_sim/bin/python sim_reference_overlay/build_real_safe_reference.py \
+  sim_reference_overlay/data/npz/dun.npz \
+  --output-root sim_reference_overlay/data/csv_dun_real_near_full \
+  --name dun_real_near_full \
+  --source-start-frame 12 \
+  --source-end-frame 1525 \
+  --brake-joint-speed-limit 1.5 \
+  --brake-non-arm-speed-limit 0.7 \
+  --assume-isaaclab-order
+```
+
+This keeps source frames 12 through 1525 (98.376 percent from the selected
+start to source end) and excludes the final 25 source frames. Frame 1525 was
+chosen because both feet are nearly stationary there. Its remaining motion is
+primarily in the arms, so the 0.5 s C2 brake is allowed up to `1.5 rad/s` for
+all joints while a separate `0.7 rad/s` guard remains enforced for every waist
+and leg joint. The generated brake measures about `1.337 rad/s` overall and
+`0.265 rad/s` for non-arm joints. This explicit exception does not apply to the
+default stage-1 command.
+
+The near-full return-to-default fit can move an individual foot marker by up to
+about `8.57 cm`. Inspect that return in closed-loop MuJoCo and repeat the
+suspended progression before considering supported playback. Near-full is
+still a staged test artifact, not a safety certification of the source motion.
+
+Before any real playback, complete the closed-loop MuJoCo test. The next
+real-robot stage should enter CONTROL while paused at frame 0 and must not press
+`T`. Only after that suspended test passes should staged playback be considered.
+
+## Reconstruct full NPZ files
+
+Deployment CSV stores only 14 selected body signals, while the source
+`dun.npz` schema contains all 30 G1 bodies. The reverse converter uses the same
+MuJoCo scene to reconstruct the missing 16 body poses and velocities, then
+copies the original 14 CSV body signals back exactly:
+
+```bash
+.venv_sim/bin/python sim_reference_overlay/convert_csv_motions_to_npz.py \
+  sim_reference_overlay/data/csv_dun_real_safe \
+  sim_reference_overlay/data/npz/dun_real_safe_stage1.npz
+
+.venv_sim/bin/python sim_reference_overlay/convert_csv_motions_to_npz.py \
+  sim_reference_overlay/data/csv_dun_real_near_full \
+  sim_reference_overlay/data/npz/dun_real_near_full.npz
+```
+
+The converter refuses to overwrite an existing file. Each output has the same
+nine keys, canonical 29-joint/30-body name arrays, float32 signal dtypes, and
+uncompressed NPZ layout as `dun.npz`. It verifies that loading the result back
+through the existing NPZ-to-CSV path reproduces all six source CSV arrays
+exactly at float32 precision.
+
 ## Other options
 
 ```text

@@ -141,6 +141,7 @@ class PreparedMotion:
     joint_order_validation: str
     body_order_validation: str
     quaternion_max_norm_deviation: float
+    derivation_notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -357,7 +358,7 @@ def load_and_prepare(
         "body_ang_vel_w": source_arrays["body_ang_vel_w"][:, RELEASE_BODY_INDEXES, :],
     }
 
-    return PreparedMotion(
+    motion = PreparedMotion(
         name=name,
         source_path=source,
         source_sha256=sha256_file(source),
@@ -368,6 +369,83 @@ def load_and_prepare(
         body_order_validation=body_order_validation,
         quaternion_max_norm_deviation=quaternion_max_deviation,
     )
+    validate_prepared_motion(motion)
+    return motion
+
+
+def validate_prepared_motion(motion: PreparedMotion) -> None:
+    """Validate a release-layout motion before it is serialized.
+
+    ``load_and_prepare`` performs stricter validation of the original 30-body
+    NPZ. This public validator covers the reduced 14-body contract as well so
+    derived motions can safely use :func:`publish_prepared_motion`.
+    """
+
+    _safe_motion_name(motion.name)
+    if motion.fps != EXPECTED_FPS:
+        raise ConversionError(
+            f"prepared motion must be {EXPECTED_FPS} Hz, got {motion.fps}"
+        )
+    if motion.timesteps <= 0:
+        raise ConversionError("prepared motion contains no frames")
+    if set(motion.arrays) != set(REQUIRED_ARRAYS):
+        missing = sorted(set(REQUIRED_ARRAYS) - set(motion.arrays))
+        extra = sorted(set(motion.arrays) - set(REQUIRED_ARRAYS))
+        raise ConversionError(
+            f"prepared motion has the wrong array keys; missing={missing}, extra={extra}"
+        )
+
+    body_count = int(RELEASE_BODY_INDEXES.size)
+    expected_shapes = {
+        "joint_pos": (motion.timesteps, NUM_JOINTS),
+        "joint_vel": (motion.timesteps, NUM_JOINTS),
+        "body_pos_w": (motion.timesteps, body_count, 3),
+        "body_quat_w": (motion.timesteps, body_count, 4),
+        "body_lin_vel_w": (motion.timesteps, body_count, 3),
+        "body_ang_vel_w": (motion.timesteps, body_count, 3),
+    }
+    for key, expected_shape in expected_shapes.items():
+        array = np.asarray(motion.arrays[key])
+        if array.shape != expected_shape:
+            raise ConversionError(
+                f"prepared {key} must have shape {expected_shape}, got {array.shape}"
+            )
+        if not np.issubdtype(array.dtype, np.floating):
+            raise ConversionError(
+                f"prepared {key} must use a floating dtype, got {array.dtype}"
+            )
+        if not np.isfinite(array).all():
+            bad = int(array.size - np.count_nonzero(np.isfinite(array)))
+            raise ConversionError(
+                f"prepared {key} contains {bad} NaN or infinite values"
+            )
+
+    quaternion_norms = np.linalg.norm(
+        motion.arrays["body_quat_w"].astype(np.float64), axis=-1
+    )
+    quaternion_max_deviation = float(np.max(np.abs(quaternion_norms - 1.0)))
+    if quaternion_max_deviation > QUATERNION_NORM_TOLERANCE:
+        raise ConversionError(
+            "prepared body_quat_w contains non-unit quaternions: maximum norm "
+            f"deviation is {quaternion_max_deviation:.6g}, limit is "
+            f"{QUATERNION_NORM_TOLERANCE:g}"
+        )
+    if not np.isfinite(motion.quaternion_max_norm_deviation):
+        raise ConversionError("quaternion_max_norm_deviation must be finite")
+    if (
+        motion.quaternion_max_norm_deviation > QUATERNION_NORM_TOLERANCE
+        or motion.quaternion_max_norm_deviation + 1.0e-7 < quaternion_max_deviation
+    ):
+        raise ConversionError(
+            "quaternion_max_norm_deviation is inconsistent with body_quat_w: "
+            f"recorded={motion.quaternion_max_norm_deviation:.9g}, "
+            f"actual={quaternion_max_deviation:.9g}"
+        )
+    for note in motion.derivation_notes:
+        if not note.strip() or "\n" in note or "\r" in note:
+            raise ConversionError(
+                "each derivation note must be non-empty and contain no newlines"
+            )
 
 
 def _write_csv(path: Path, array: np.ndarray, headers: Sequence[str]) -> None:
@@ -431,8 +509,11 @@ def _write_info(path: Path, motion: PreparedMotion) -> None:
         "Quaternion convention: world-frame (w, x, y, z)",
         "Quaternion max norm deviation: "
         f"{motion.quaternion_max_norm_deviation:.9g}",
-        "",
     ]
+    if motion.derivation_notes:
+        lines.extend(["", "Derivation:"])
+        lines.extend(f"  {note}" for note in motion.derivation_notes)
+    lines.append("")
     for key in REQUIRED_ARRAYS:
         array = motion.arrays[key]
         flat = array.reshape(-1)
@@ -499,20 +580,13 @@ def verify_generated_motion(
     return maximum_errors
 
 
-def convert_npz(
-    source_path: str | Path,
+def publish_prepared_motion(
+    motion: PreparedMotion,
     output_root: str | Path,
-    motion_name: str | None = None,
-    *,
-    assume_isaaclab_order: bool = False,
 ) -> tuple[Path, dict[str, float]]:
-    """Convert and atomically publish one NPZ reference dataset."""
+    """Validate and atomically publish one prepared reference dataset."""
 
-    motion = load_and_prepare(
-        source_path,
-        motion_name,
-        assume_isaaclab_order=assume_isaaclab_order,
-    )
+    validate_prepared_motion(motion)
     destination = Path(output_root).expanduser().resolve()
     if destination.exists() or destination.is_symlink():
         raise ConversionError(
@@ -541,6 +615,23 @@ def convert_npz(
         raise
 
     return destination / motion.name, maximum_errors
+
+
+def convert_npz(
+    source_path: str | Path,
+    output_root: str | Path,
+    motion_name: str | None = None,
+    *,
+    assume_isaaclab_order: bool = False,
+) -> tuple[Path, dict[str, float]]:
+    """Convert and atomically publish one NPZ reference dataset."""
+
+    motion = load_and_prepare(
+        source_path,
+        motion_name,
+        assume_isaaclab_order=assume_isaaclab_order,
+    )
+    return publish_prepared_motion(motion, output_root)
 
 
 def build_parser() -> argparse.ArgumentParser:
