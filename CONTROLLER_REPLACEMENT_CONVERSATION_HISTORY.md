@@ -1,6 +1,6 @@
 # SONIC checkpoint 与全身 Controller Replacement 实验：对话历史及技术演进记录
 
-> 整理日期：2026-09-02
+> 整理日期：2026-09-09
 > 覆盖范围：本次 Codex 会话中可追溯的讨论、源码检查、数据验证、实验实现、结果分析与 Git 演进。
 > 文档性质：技术纪要，不是逐字聊天记录；已省略重复提问、工具调用细节、内部运行日志以及可能包含环境敏感信息的原始 JSONL 内容。
 
@@ -69,6 +69,9 @@
 
 11. **“物体动了”不等于任务成功。**
     新轨迹是否仍可作为 manipulation 训练数据，必须结合轨迹完整性、跌倒、tracking、contact、物体终态以及任务专属语义判定；最后仍应通过 replay 或自动 evaluator 确认。
+
+12. **完整的 controller-replacement 条件矩阵已经生成并认证。**
+    七份 recording 已完成 `4 controller × 2 reference × 2 root-assist` 的 112 组固定步实验；所有轨迹都完整、数值有限且未跌倒，少量重复运行也证明数值确定性。但这些自动认证仍不是语义任务成功标签。
 
 ---
 
@@ -141,6 +144,8 @@ q_target（或 q_cmd）
 | I | 统一确定性实验协议 | `controller_replacement/` |
 | J | 替换为 NVIDIA 官方 regular 模型/config，清理 planner | 官方 1762 维 regular 接口 |
 | K | 实时 reference ghost 与 staged motion 工具 | `sim_reference_overlay/` |
+| L | 运行完整 `7×4×2×2` 条件矩阵 | 112 组 protocol2 轨迹、证书审计和 replay 验证 |
+| M | 确定性复测、ghost 显示机制和 root 前后定量分析 | 区分轨迹差异、可视化伪影与固定步可复现性 |
 
 ---
 
@@ -591,21 +596,28 @@ regular config 的名义 future offset 是：
 - 实心机器人：新 rollout；
 - 青色半透明 body：原 recording 同一时刻的实际 qpos；
 - 橙色半透明手：原 recording 同一时刻的实际手指 qpos；
-- `--ghost-mode source`：默认，直接比较新轨迹与原成功执行轨迹；
-- `--ghost-mode reference`：显示构造给 tracker 的 50 Hz reference，适合检查 tracker 跟踪误差。
+- `--ghost-mode source`：默认；protocol2 直接使用 `source_timeline.npz` 中每个 400 Hz 输出样本的 phase-matched 原 recording qpos，适合比较新轨迹与原成功执行轨迹；
+- `--ghost-mode reference`：使用 `prepared_reference.npz` 的 policy 边界，显示从原 recording 采样的 50 Hz qpos ghost；它是可视化用的 sample-and-hold 代理，不是把 SONIC encoder 的十个 future slot 同时画出来。
+
+`reference` 模式不做姿态插值。在当前 400 Hz CSV 中，一个 50 Hz ghost 姿态通常保持 8 行，再在 20 ms 边界切换到下一姿态。因此：
+
+- 若画面是“姿态一卡一跳”，主要是 50 Hz reference sample-and-hold，不应称为 action chunk 跳变；
+- 若只是实心与 ghost 重合处局部亮暗闪烁，更可能是半透明近共面 mesh 的深度/透明排序伪影。
+
+可分别用 `--ghost-mode source` 和 `--ghost-offset 0.03 0 0` 区分这两种现象。
 
 曾出现橙色 ghost 手指异常巨大，后来定位为 ghost joint/geom 映射问题并修复。
 
 ### 10.2 为什么 Python compare 看起来更慢
 
-Python compare 每个显示帧需要：
+**[已验证]** compare replay 不运行 encoder/decoder/ONNX controller，也不通过 `mj_step` 重新生成轨迹。它启动时读取已保存的 CSV 和 sidecar，然后逐行设置 qpos。每个显示样本需要：
 
-- 更新实心机器人；
-- 更新 ghost；
-- 对两个状态做 `mj_forward`；
-- 同步 viewer。
+- 更新实心机器人并做一次 `mj_forward`；
+- 更新 ghost 并再做一次 `mj_forward`；
+- 重建约 50 个 ghost mesh geom；
+- 执行 `viewer.sync()` 和透明渲染。
 
-**[推测]** 如果它试图逐个显示 200/400 Hz 数据行，双机器人状态更新、`mj_forward` 和 viewer sync 的额外负载可能让墙上播放低于实时。旧 C++ replay 更接近“数据线程按时间推进，画面取最新状态”，因此可能看起来更快。没有专门 profiling 时，不能断言瓶颈一定就是两个 `mj_forward`；可以确定的是播放观感差异不等于保存轨迹的仿真时间真的变慢。
+当 CSV 为 400 Hz 时，每行墙上时间预算只有 2.5 ms。当前播放循环落后时不跳帧，而是仍把每一行依次画完；所以只要上述整套工作超过 2.5 ms，整段动作就会慢放。这是 Python、MuJoCo 正向运动学、ghost 几何更新和 Viewer 同步构成的可视化吞吐问题，不是 checkpoint 实时生成慢。尚未单独 profile 每一子项，因此不把瓶颈武断地只归因于 GPU 渲染或某一次 `mj_forward`。
 
 ### 10.3 root assist 的实现
 
@@ -1034,6 +1046,8 @@ Teleopit 结果：
 
 因此新 `data.csv` 能被现有 replay 读取，但用于训练或分析时必须同时读取 `data_schema.json` 和 telemetry，尤其不能把 Teleopit 的零 token 当作有效 SONIC token。
 
+输出发布采用每个最终目录一个隐藏的 `.<result-name>.lock` 文件。它是 0 字节的 Linux `flock` 载体，用来阻止两个进程同时生成或覆盖同名结果；它不是实验数据或失败标志。进程退出后内核锁已释放，但空文件故意保留，避免删除/重建 inode 造成并发竞态。归档时可以不复制 lock，日常使用则建议保留。
+
 ### 14.9 统一方案之外的 `sim_reference_overlay`
 
 在 checkpoint/controller replacement 之后，又增加了 `sim_reference_overlay/`，用于正常 sim2sim 时同时显示 controller 正在消费的 reference：
@@ -1054,7 +1068,7 @@ Teleopit 结果：
 
 ---
 
-## 15. 七份标准 recording 与已有统一实验
+## 15. 七份标准 recording 与正式条件矩阵
 
 标准批次：
 
@@ -1068,6 +1082,8 @@ Teleopit 结果：
 20260722_160121_g1_sim
 ```
 
+### 15.1 早期统一实验（历史）
+
 统一程序初版曾对七份数据运行 regular + `reference_motion` + no root assist。记录的初版 tracking 摘要如下；这些数值用于回顾，不应与后续 protocol2 修正结果直接混表：
 
 | Recording | policy count | CSV rows | body RMSE | root XYZ RMSE |
@@ -1080,9 +1096,125 @@ Teleopit 结果：
 | `20260722_145020` | — | — | 0.12796 | 0.01911 |
 | `20260722_160121` | — | — | 0.12601 | 0.00664 |
 
-审计后，`20260612_144154`、`20260612_144214`、`20260722_154958`、`20260722_145020` 又按 protocol2 重跑。当前磁盘上这四个 `_protocol2` 目录具有完整认证，但它们记录的是当时 protocol2 + 旧 1751 regular wrapper，只能作为该历史条件下的正式结果。若要分析当前官方 1762 regular，仍需用当前模型重跑并生成新的 manifest，不能只因目录名含 `_protocol2` 就沿用旧结果。
+审计后，`20260612_144154`、`20260612_144214`、`20260722_154958`、`20260722_145020` 又按 protocol2 重跑。顶层的这四个历史 `_protocol2` 目录使用当时的旧 1751 regular wrapper；它们不会因当前默认模型更换而自动变成 1762 结果。
 
-任务成功不能仅从 body RMSE 判断。抽屉任务需要检查抓取、物体进入目标区域和抽屉关闭；垃圾桶任务需要检查脚是否踩中并维持稳定；其他任务必须先定义 evaluator。
+### 15.2 官方模型的 `7×4×2×2` 正式矩阵
+
+2026-09-08 完成了当前统一协议的完整矩阵：
+
+| 维度 | 条件 |
+|---|---|
+| recording | 上述 7 份 |
+| controller | regular / low-latency / SONIC v1.1 / Teleopit v0.5 |
+| reference | `reference_motion` / `executed_qpos` |
+| root assist | `none` / `xy` |
+
+总数为 `7 × 4 × 2 × 2 = 112`，正式结果在：
+
+```text
+controller_replacement/data/matrix_7x4_reference_motion_executed_qpos_none_xy
+```
+
+全部使用 raw policy-group offset 11、source-history prefill、10 次 self-warmup、`sonic_release` 手部力矩、0.2 m fall threshold、ORT CPU 和 no-viewer；时序仍是 2 kHz physics / 200 Hz PD / 50 Hz policy / 400 Hz CSV。其中 regular 已使用当前 NVIDIA 官方 1762 维 encoder/config，不是上一节的旧 1751 wrapper。
+
+**[已验证]** 完整性与 provenance 审计结果：
+
+- 112/112 个结果完成，启动失败 0，缺失/额外/重复组合均为 0；
+- 共 41,488 次 policy inference、331,904 行 400 Hz CSV；
+- 112/112 均为 fixed-step、finite state、`fallen=false`、`task_success_eligible=true`；
+- 每份证书登记 12 个主要 artifact，重算 1,344/1,344 个 SHA-256，不匹配数为 0；
+- 107 项统一程序单元测试通过；
+- MuJoCo 3.2 下 source/reference ghost 各做 112 次 dry-run，MuJoCo 3.10 下 source ghost 再做 112 次并核对 compiled-model fingerprint，共 336 次，失败 0。
+
+`20260722_160121` 的 16 个组合都是 requested 376、executed 375。原因是末尾不足完整的 8 个 400 Hz source 样本，按既定 tail policy 丢弃最后一帧；这不是 controller 失败。
+
+### 15.3 矩阵自动指标
+
+下表是 7 个 recording 等权的宏平均；`RM=reference_motion`、`EQ=executed_qpos`，角度单位为 rad，root 位移单位为 m。`root XYZ RMSE` 比较实体机器人与同一仿真时刻的 phase-matched source root。
+
+| controller | ref | assist | joint/reference RMSE | root XYZ RMSE | fallen / eligible |
+|---|---|---|---:|---:|---:|
+| regular | EQ | none | 0.0513 | 0.0344 | 0/7 / 7/7 |
+| regular | EQ | xy | 0.0484 | 0.0035 | 0/7 / 7/7 |
+| regular | RM | none | 0.1348 | 0.0229 | 0/7 / 7/7 |
+| regular | RM | xy | 0.1343 | 0.0018 | 0/7 / 7/7 |
+| low-latency | EQ | none | 0.1018 | 0.0666 | 0/7 / 7/7 |
+| low-latency | EQ | xy | 0.0984 | 0.0043 | 0/7 / 7/7 |
+| low-latency | RM | none | 0.1448 | 0.0670 | 0/7 / 7/7 |
+| low-latency | RM | xy | 0.1438 | 0.0029 | 0/7 / 7/7 |
+| SONIC v1.1 | EQ | none | 0.0854 | 0.0334 | 0/7 / 7/7 |
+| SONIC v1.1 | EQ | xy | 0.0807 | 0.0030 | 0/7 / 7/7 |
+| SONIC v1.1 | RM | none | 0.1365 | 0.0582 | 0/7 / 7/7 |
+| SONIC v1.1 | RM | xy | 0.1342 | 0.0029 | 0/7 / 7/7 |
+| Teleopit v0.5 | EQ | none | 0.0702 | 0.0616 | 0/7 / 7/7 |
+| Teleopit v0.5 | EQ | xy | 0.0722 | 0.0030 | 0/7 / 7/7 |
+| Teleopit v0.5 | RM | none | 0.1019 | 0.0483 | 0/7 / 7/7 |
+| Teleopit v0.5 | RM | xy | 0.1059 | 0.0033 | 0/7 / 7/7 |
+
+这些数值支持的结论有明确边界：
+
+- `xy` 下 source root x/y RMSE 的最大值仅约 `8.3e-9 m`，表中剩余 XYZ 误差主要是 z；这证明 oracle 正常生效，不证明 controller 自主 root tracking；
+- 与 none 配对比较时，`xy` 使 56 对中的 41 对环境接触帧占比升高、11 对降低、4 对不变；root assist 会真实改变接触物理；
+- EQ 下 regular 在两种 assist、全部 7 份 recording 中的 joint/reference RMSE 最低；RM 下 Teleopit 在对应 14 项中最低；这只是 tracking 指标，不是任务成功率；
+- 仅 `20260612_144214 + executed_qpos + none` 的两条轨迹出现 body torque saturation：SONIC v1.1 为 18/936 个 evaluation PD update（1.923%），regular 为 4/936（0.427%），均为 `left_ankle_pitch_joint` 到达 scene 的 50 Nm 上限；其余 110 条为 0。
+
+112 份 `metrics.json` 中的 `semantic_task_success.value` 均为 `null`。`task_success_eligible=true` 只表示轨迹完整、数值有限且未跌倒，不能写成“112 个任务成功”。抽屉任务需要检查抓取、物体进入目标区域和抽屉关闭；垃圾桶任务需要检查脚是否踩中并维持稳定；其他任务必须先定义 evaluator。
+
+### 15.4 确定性抽查与鲁棒性重复的区别
+
+另外抽取 4 个完整组合各重跑一次，覆盖四种 controller、两种 reference 和两种 assist：
+
+```text
+regular      + reference_motion + none
+low-latency  + reference_motion + xy
+SONIC v1.1   + executed_qpos     + none
+Teleopit     + executed_qpos     + xy
+```
+
+复测目录为：
+
+```text
+controller_replacement/data/determinism_repeat_4
+```
+
+**[已验证]** `policy_telemetry`、contact、source timeline、prepared reference 等核心 NPZ 字节完全一致；`data.csv` 的所有数值和状态一致，唯一文本差异是输出目录导致的 `scene_path`；`metrics.json` 只差墙钟耗时和诊断 RTF。这证明当前固定步协议的数值可复现性。
+
+这 4 次是确定性检查，不是独立成功率样本，不能代替每条件 3–5 次的鲁棒性实验或置信区间。**[用户决策]** 当前暂不做 3–5 次大规模重复，先完成任务语义检查。
+
+### 15.5 `20260612_144127` 的 root 前后差异
+
+用户在 `reference_motion + root-assist none` 中观察到 low-latency 实体机器人在青色 ghost 前方，regular 和 SONIC v1.1 在后方。数值检查排除了 Viewer 错位：
+
+- 三条结果的 `source_timeline.npz` 和 `prepared_reference.npz` 分别逐字节相同；
+- 都是 2104 个 400 Hz 样本、5.2575 s、policy_seq `20173..20435`；
+- 三个实体机器人的第一帧完整 qpos 与 ghost 逐元素一致；
+- MuJoCo scene、Kp/Kd、history 条件相同，三者都没有 torque saturation。
+
+跳过 10 次 self-warmup 后，以 source evaluation 首行到末行的水平位移方向定义前进轴；evaluation 段的定量结果为：
+
+| controller | 平均前进速度 | 末端实体相对 source |
+|---|---:|---:|
+| source ghost | 0.112 m/s | 0 |
+| regular | 0.102 m/s | 后 4.65 cm |
+| low-latency | 0.133 m/s | 前 11.47 cm |
+| SONIC v1.1 | 0.089 m/s | 后 11.30 cm |
+
+low-latency 还有约 7.6 cm 的末端横向偏差。先前未固化为脚本的探索性 progress/velocity 平滑与 cross-correlation 分析给出约 0.17–0.21 s 的相位提前；这个范围只是诊断线索，证据等级低于可从当前产物直接重算的速度和末端差值。即使采用该时间平移，也不能解释全部横向与前后偏差：low-latency 同时存在真实 over-travel；regular 和 v1.1 则主要是 under-travel，不是一个固定时延就能解释。
+
+直接机制是：
+
+```text
+不同原生 reference view + 不同 encoder/decoder
+  → 不同腿部 q_target 和力矩
+  → 不同落脚、地面反力和推进速度
+  → 因 SONIC 没有绝对 root xy 误差闭环，偏差继续积累
+```
+
+这份 recording 的 regular/v1.1 记录槽实际近似 `[0,4,4,...,4]`，即当前姿态加约 80 ms 后的同一姿态重复；low-latency adapter 则按其原生约定使用 `[0,1,...,9]`，看到 0–180 ms 的连续运动。这与 low-latency 的提前和更强推进一致，但三个 checkpoint 权重和 encoder 本身也不同，所以仅凭这三条 rollout 不能把因果全部归给 future window。
+
+low-latency 约在 1.08 s 已领先 2 cm，而它最早在 4.058 s 才与任务环境接触；因此早期领先不是“碰到垃圾桶后被推到前面”造成的。三者 joint/reference RMSE 却很接近（0.1488 / 0.1473 / 0.1439 rad），说明身体关节 tracking 相近不保证 floating root 位移相同。
+
+**[用户决策]** 当前不为了消除视觉上的快慢/前后差异而立即加入 action delay；对静态物体任务，先看新 controller 是否真正完成语义任务。但 root 路径仍会改变接触，所以前后偏差仍应作为分析指标保留；延迟辨识仍是后续工作。
 
 ---
 
@@ -1147,27 +1279,28 @@ change_ckpt/models/planner/target_vel/V2/planner_planner_sonic.trt
 
 - 当前 `change_ckpt/models/regular/` 已经是 NVIDIA 官方 **1762 维** encoder/config；
 - 当前七个 `change_ckpt/data/*_regular` 和七个 `change_ckpt_track/data/*_regular`（不含另存的 `_old`）的 manifest 都仍指向已删除的旧 `observation_config_sonic_release.yaml`，并记录早期 **1751 维 wrapper** 的 encoder/decoder hash `c6bd…` / `6309…`；
-- 当前磁盘上四个 `controller_replacement/data/*_protocol2` 结果也都由提交 `3a41663` 附近的旧 1751 regular 模型生成；
+- `controller_replacement/data/` 顶层原有的四个历史 `*_protocol2` 结果由提交 `3a41663` 附近的旧 1751 regular 模型生成；
+- 新的 `matrix_7x4_reference_motion_executed_qpos_none_xy/` 是独立子目录，其 112 份结果按 manifest 认证了当前模型；其中 regular 明确使用官方 1762 维 encoder/config；
 - `39272d0` 之后虽然代码和默认模型已经切到官方 1762 接口，旧结果目录不会因此自动变成新模型结果。
 
-因此，任何正式表格都必须读取每个结果自己的 `run_manifest.json` / `launch_manifest.json`，按模型 SHA、config SHA、代码 commit 和协议版本分组。若要宣称“官方 regular 1762 模型的结果”，需要用当前代码和当前模型重新运行，不能仅按目录名含有 `_regular` 判断。
+因此，任何正式表格都必须读取每个结果自己的 `run_manifest.json` / `launch_manifest.json`，按模型 SHA、config SHA、代码 commit 和协议版本分组。当前 112 组矩阵可以作为官方 regular 1762 与其他三种 controller 的当前协议结果；旧的 `_regular` / `_protocol2` 目录仍不能只凭名称混入。
 
 另外，`change_ckpt/SONIC_V1_1_REFERENCE_RESULTS.md` 所列的六个标准 v1.1 输出目录，以及 `change_ckpt_track/data/sonic_v1_1_comparison/`，当前都已不在磁盘。Markdown 结果表仍是历史记录，但已经不能重新做 artifact/hash 复核。
 
 ### 16.3 Git 分支和远端
 
-创建本文前的仓库快照：
+2026-09-09 本次增补开始前的仓库快照：
 
 - 当前分支：`custom/checkpoint-rollout`；
-- HEAD：`ae06523 Add staged real-robot motion tooling`；
-- 与本地缓存的 `origin/custom/checkpoint-rollout` remote-tracking ref 一致；
+- 上一版本纪要已由 `217a390 docs: add controller replacement experiment history` 提交并 push；
+- 当时 HEAD 与本地缓存的 `origin/custom/checkpoint-rollout` remote-tracking ref 均为 `217a390`，工作区 clean；
 - 本地 `main`、`origin/main`、`upstream/main` 均指向 `1983e88`；
-- 当前分支相对本地记录的 `upstream/main`：ahead 16、behind 0；
+- 上一版本纪要提交后，当前分支相对本地记录的 `upstream/main` 为 ahead 17、behind 0；
 - `origin`：用户 fork `QingfangZhang/GR00T-WholeBodyControl`；
 - `upstream`：NVIDIA `NVlabs/GR00T-WholeBodyControl`；
 - 备份 tag：`backup/pre-upstream-sync-20260730` → `fde3dda`；该 tag 保留同步前的旁支历史，`fde3dda` 不是当前 HEAD 的祖先。
 
-注意：这里的 `origin` 和 `upstream` 都是本地 remote-tracking ref 快照；本轮没有重新 `git fetch`，所以不能把它写成“已经确认 2026-09-02 服务器上的远端实时状态”。创建本文后，本文本身目前是新的未跟踪文件，因此工作树不再是完全 clean。
+注意：这里的 `origin` 和 `upstream` 均是本地 remote-tracking ref 快照；本轮没有重新 `git fetch`，所以不能写成“已确认服务器的最新实时状态”。本次增补完成后的准确提交以 `git log` 中包含本文修订的新提交为准，避免在文档内写入无法自指的“本提交 hash”。
 
 `.gitignore` 与 `.git/info/exclude` 的区别也在对话中确认过：
 
@@ -1196,8 +1329,9 @@ change_ckpt/models/planner/target_vel/V2/planner_planner_sonic.trt
 | `39272d0` | 切换为官方 SONIC regular 1762 接口 |
 | `a2542ba` | 增加 `sim_reference_overlay/` |
 | `ae06523` | 增加 staged real-robot motion 工具和 CSV→NPZ |
+| `217a390` | 增加经脱敏整理的 controller-replacement 对话与技术纪要 |
 
-按 `git diff upstream/main...HEAD` 的三点比较口径，当前实验分支有 113 个文件差异，约 49,201 行新增、4 行删除，绝大多数隔离在实验目录。官方已有源码中的直接修改主要是：
+与 `upstream/main` 的差异绝大多数隔离在实验目录。文件/行数会随本文继续增补而变化，需要时应以当时的 `git diff --stat upstream/main...HEAD` 为准。官方已有源码中的直接修改主要是：
 
 - `gear_sonic/eval_agent_trl.py`；
 - `gear_sonic/scripts/run_sim_loop.py`；
@@ -1236,6 +1370,8 @@ Teleopit_rollout/.venv/bin/python controller_replacement/launch_rollout.py \
   --root-assist none
 ```
 
+rollout 默认是 no-viewer；只有显式加 `--viewer` 才会在生成轨迹时打开显示窗口。正式批量实验使用 no-viewer。
+
 更换 controller：
 
 ```text
@@ -1264,6 +1400,24 @@ controller_replacement/run_experiments.sh \
   sample_data/ztj/20260612/20260720_144342_g1_sim
 ```
 
+例如，正式矩阵中 `20260722_154958 + SONIC v1.1 + reference_motion + none` 的完整调用是：
+
+```bash
+Teleopit_rollout/.venv/bin/python \
+  controller_replacement/launch_rollout.py \
+  sample_data/ztj/20260612/20260722_154958_g1_sim \
+  --controller sonic_v1_1 \
+  --reference-mode reference_motion \
+  --root-assist none \
+  --raw-policy-group-offset 11 \
+  --hand-torque-profile sonic_release \
+  --fall-height-m 0.2 \
+  --device cpu \
+  --output-root controller_replacement/data/matrix_7x4_reference_motion_executed_qpos_none_xy
+```
+
+对应的 xy 条件只把 `--root-assist none` 改为 `--root-assist xy`；其他参数不变。对同名已完成结果重复运行时，程序会先验证 recording、模型、scene 和 CLI 条件，再事务式覆盖。
+
 ### 17.2 查看结果
 
 下面的 native C++ replay 依赖 MuJoCo 3.2 和 GLFW shared library。普通 shell 下当前 `ldd` 仍会显示 `libmujoco.so.3.2.0`、`libglfw.so.3` 未找到，因此运行前必须正确配置动态库搜索路径；仅激活 Python venv 不一定会改变 native ELF 的查找路径。
@@ -1280,6 +1434,12 @@ controller_replacement/run_experiments.sh \
 ```bash
 .venv_replay/bin/python controller_replacement/replay_mujoco_compare.py \
   controller_replacement/data/<result-folder>
+```
+
+上述命令默认等价于加 `--ghost-mode source`。若要看 50 Hz policy-boundary sample-and-hold ghost，显式加：
+
+```text
+--ghost-mode reference
 ```
 
 先做无 GUI 校验：
@@ -1384,7 +1544,7 @@ ICRA 更自然地接受系统、控制、接触和机器人评测；若投 ICLR�
 5. **ORT/TensorRT parity**：当前正式统一结果来自 ORT CPU；in-process TensorRT backend 尚未实现。
 6. **任务 evaluator**：多数任务仍依赖人工 replay，物体发生运动或接触不等于任务成功。
 7. **root assist 的科学解释**：xy assist 是 oracle，必须与 native controller 结果分表；不能以 assisted success 证明 controller 独立能力。
-8. **统计规模**：目前数据量、controller 数量和重复次数不足以形成可靠成功率结论。
+8. **语义标签与统计重复**：已有 7 份 recording、4 种 controller 和 112 个单次条件，但还没有 task-specific 成功标签，也没有每条件 3–5 次的独立鲁棒性重复；因此仍不能给出成功率置信区间。
 9. **VLA 数据价值**：轨迹“看起来可用”不等于能提升 GR00T/VLA；仍需实际 finetune/evaluation。
 10. **外部数据场景恢复**：HumanoidEveryday 等数据若没有完整任务环境，接触成功无法可靠验证。
 
@@ -1392,14 +1552,11 @@ ICRA 更自然地接受系统、控制、接触和机器人评测；若投 ICLR�
 
 ## 20. 后续建议的实验顺序
 
-1. 固定当前 `controller_replacement` protocol2，不再同时改变 reference、PD、history 和 timing。
-2. 对七份标准 recording 分别运行：
-   - regular / low-latency / v1.1 / Teleopit；
-   - `reference_motion`；
-   - root assist `none` 与 `xy`。
-3. 每个条件至少重复 3–5 次；固定随机性并记录机器、backend、模型和 scene hash。
-4. 先量化 source/action/接触之间的 cross-correlation，再把确定性 action delay（例如 0/10/20 ms）作为辨识性 ablation，不能预先把 10 ms 当作真实延迟。
-5. 为抽屉、垃圾桶和其他场景编写 task-specific evaluator。
+1. 继续固定当前 `controller_replacement` protocol2，不再同时改变 reference、PD、history 和 timing。
+2. **[已完成]** 七份标准 recording 的 regular / low-latency / v1.1 / Teleopit × `reference_motion` / `executed_qpos` × root assist `none` / `xy`，共 112 组。
+3. 先按任务检查这 112 条轨迹：为抽屉、垃圾桶和其他场景编写 task-specific evaluator；在 evaluator 尚未完成时，使用 source-ghost replay 做脱敏的人工成功标注。
+4. **[已完成确定性抽查]** 4 个代表组合各重跑一次，数值结果一致。**[用户决策]** 每条件 3–5 次的鲁棒性实验暂不做；等语义 evaluator 和成功判定固定后再执行，用来估计成功率与置信区间。
+5. 对 root 路径会改变接触的关键失败案例，先量化 source/action/接触之间的关系，再把确定性 action delay（例如 0/10/20 ms）作为辨识性 ablation；不能预先把 10 ms 当作真实延迟。
 6. 分别报告：
    - stability/fall；
    - body/anchor/root tracking；
@@ -1407,9 +1564,9 @@ ICRA 更自然地接受系统、控制、接触和机器人评测；若投 ICLR�
    - contact/torque；
    - task success；
    - assist 依赖。
-7. 再运行 `executed_qpos` ablation，解释 reference intent 与旧执行轨迹的差异。
+7. 在同一任务标签下成对比较 `reference_motion` 与 `executed_qpos`，解释 reference intent 与旧执行轨迹的差异。
 8. GPU 条件具备时加入 TensorRT parity；不要重新引入非确定性 DDS/ZMQ 才能使用 TensorRT。
-9. 从自动 evaluator 通过的迁移轨迹中构造训练集，最后验证 GR00T/VLA 微调收益。
+9. 从 evaluator 通过的迁移轨迹中构造训练集，最后验证 GR00T/VLA 微调收益。
 
 ---
 
@@ -1431,7 +1588,8 @@ ICRA 更自然地接受系统、控制、接触和机器人评测；若投 ICLR�
 | canonical lag | observation config 名义定义的 future offset |
 | root assist xy | 运行时硬对齐 root x/y 与 vx/vy 的 oracle |
 | ghost source | 原 recording 同一时刻的实际 qpos，可视化用 |
-| ghost reference | 构造给 tracker 的 reference pose，可视化用 |
+| ghost reference | 按 prepared policy boundary 从原 recording qpos 采样的 50 Hz sample-and-hold 可视化代理；不是完整的十槽 encoder 输入 |
+| output lock | 最终结果目录旁的隐藏 0 字节 `.<result-name>.lock`；用于同名输出的进程互斥，不是数据或失败标志 |
 | ORT | ONNX Runtime；当前统一程序实际使用的 backend |
 | TensorRT | NVIDIA 推理 backend；旧 C++ deploy 使用，统一程序尚未接入 |
 | task success eligible | 轨迹完整、未跌倒且满足继续进行语义成功判定的资格，不等于已成功 |
@@ -1442,7 +1600,9 @@ ICRA 更自然地接受系统、控制、接触和机器人评测；若投 ICLR�
 
 本文件将“当前代码行为”和“历史实验结论”尽量分开：
 
-- 代码、模型和 Git 状态以 2026-09-02 本地工作区为准；
+- 代码、模型和 Git 状态以 2026-09-09 本地工作区及本地 remote-tracking ref 快照为准；除非明确记录了 `git fetch`，不能据此声称远端服务器的实时最新状态；
+- 112 组结果的完整性、计数和 hash 来自各结果的证书、manifest、metrics 及 artifact 重算；107 项测试与 336 次 replay dry-run 是对程序和可回放性的补充验证，不是额外的 rollout 或任务成功样本；
+- `20260612_144127` 的速度和末端 root 差值可由保存产物重算；0.17–0.21 s 相位范围来自未固化脚本的探索性分析，只应作为后续诊断线索；
 - 旧实验可能由早期协议、旧模型或旧 torque cap 生成，必须读取各自 manifest，不能只按目录名判断；
 - 用户在 viewer 中确认的任务现象被保留为用户观察，没有自动 evaluator 时不提升为统计结论；
 - 外部项目和论文的内容只用于形成研究方向，最终论文写作仍需重新查阅并引用原始来源；
